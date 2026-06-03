@@ -56,6 +56,18 @@ SUPPORTED_MODELS: list[ModelOption] = [
         "default_effort": "high",
         "supports_images": False,
     },
+    {
+        "id": "openai:deepseek-v4-flash",
+        "label": "DeepSeek v4 Flash",
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+    },
+    {
+        "id": "openai:deepseek-v4-pro",
+        "label": "DeepSeek v4 Pro",
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+    },
 ]
 
 SUPPORTED_MODEL_IDS: frozenset[str] = frozenset(m["id"] for m in SUPPORTED_MODELS)
