@@ -54,6 +54,10 @@ from .middleware import (
 )
 from .prompt import construct_system_prompt
 from .tools import (
+    codegraph_callees,
+    codegraph_callers,
+    codegraph_impact,
+    codegraph_search,
     fetch_url,
     http_request,
     linear_comment,
@@ -441,6 +445,125 @@ def _get_cached_sandbox_backend(thread_id: str) -> SandboxBackendProtocol:
     return sandbox_backend
 
 
+async def _resolve_task_description_for_routing(config: RunnableConfig, thread_id: str) -> str:
+    """Resolve the task description for dynamic routing from thread history or configurable."""
+    # 1. Try to get from thread state (most recent user message)
+    try:
+        state = await client.threads.get_state(thread_id)
+        messages = state.get("values", {}).get("messages", [])
+        if messages:
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict):
+                content = last_msg.get("content", "")
+            else:
+                content = getattr(last_msg, "content", "")
+            if content:
+                logger.info("Resolved task description from thread state messages")
+                return str(content)
+    except Exception as e:
+        logger.debug("Failed to resolve task description from thread state: %s", e)
+
+    # 2. Fall back to configurable webhook data structures
+    configurable = config.get("configurable", {})
+    source = configurable.get("source")
+    if source == "github":
+        github_issue = configurable.get("github_issue", {})
+        return github_issue.get("title", "")
+    elif source == "slack":
+        slack_thread = configurable.get("slack_thread", {})
+        return slack_thread.get("text", "")
+    elif source == "linear":
+        linear_issue = configurable.get("linear_issue", {})
+        return linear_issue.get("title", "")
+
+    return ""
+
+
+async def should_use_multi_agent_dynamically(config: RunnableConfig, task_desc: str) -> bool:
+    """Determine whether to use the Multi-Agent workflow dynamically based on task complexity."""
+    if not task_desc:
+        logger.info(
+            "No task description found for dynamic routing. Defaulting to Single-Agent mode."
+        )
+        return False
+
+    import json
+    import re
+
+    from langchain_core.messages import HumanMessage
+
+    task_lower = task_desc.lower()
+
+    # Rule-based fast-path for greeting and basic queries
+    simple_keywords = {"hello", "hi", "how are you", "who are you", "what is your name", "help"}
+    if task_lower.strip() in simple_keywords:
+        logger.info("Fast-path: simple greeting/query detected. Routing to Single-Agent mode.")
+        return False
+
+    # LLM-based classification for engineering tasks
+    try:
+        model_pair, _ = await get_team_default_model_pair("agent")
+        model_id, _ = model_pair
+        model = make_model(model_id, temperature=0.0)
+
+        prompt = f"""You are an AI Routing Assistant for a coding agent framework.
+Analyze the following user software engineering request:
+\"\"\"
+{task_desc}
+\"\"\"
+
+Classify if this task requires Multi-Agent collaboration (PM planning, Architect dependency scanning, QA testing) or if it can be resolved by a Single-Agent.
+Use Multi-Agent collaboration if the task involves:
+- Implementing a complex feature or making architectural design decisions.
+- Code modifications across multiple files or directories.
+- Writing complex test cases or refactoring.
+- Ambiguous or high-risk requirements.
+
+Use Single-Agent if the task is:
+- A simple code fix, localization, or single-file change (e.g. fixing a divide-by-zero bug, formatting).
+- An investigatory or information question (e.g. "what files are in this repo?").
+- Simple text edits or greeting.
+
+Respond in EXACTLY the following JSON format:
+{{
+  "use_multi_agent": true or false,
+  "reason": "short explanation"
+}}"""
+        response = await model.ainvoke([HumanMessage(content=prompt)])
+        content = response.content.strip()
+        json_match = re.search(r"\{.*\}", content, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            use_multi = data.get("use_multi_agent", False)
+            reason = data.get("reason", "")
+            logger.info(
+                "Dynamic router decision: use_multi_agent=%s. Reason: %s", use_multi, reason
+            )
+            return use_multi
+    except Exception as e:
+        logger.warning(
+            "LLM dynamic routing decision failed. Falling back to rule-based classification: %s", e
+        )
+
+    # Fallback rule-based check
+    complex_keywords = {
+        "implement",
+        "refactor",
+        "architect",
+        "feature",
+        "migrate",
+        "design",
+        "add support",
+        "integrate",
+    }
+    if any(kw in task_lower for kw in complex_keywords):
+        logger.info("Rule-based fallback: complex keywords found. Routing to Multi-Agent mode.")
+        return True
+
+    logger.info("Rule-based fallback: simple/localized task assumed. Routing to Single-Agent mode.")
+    return False
+
+
 async def get_agent(config: RunnableConfig) -> Pregel:
     """Get or create an agent with a sandbox for the given thread."""
     thread_id = config["configurable"].get("thread_id", None)
@@ -454,11 +577,13 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             tools=[],
         ).with_config(config)
 
+    use_multi_agent = config["configurable"].get("use_multi_agent")
+    if use_multi_agent is None:
+        task_desc = await _resolve_task_description_for_routing(config, thread_id)
+        use_multi_agent = await should_use_multi_agent_dynamically(config, task_desc)
+
     # Dynamic Multi-Agent routing option with recursion guard
-    if (
-        config["configurable"].get("use_multi_agent", False)
-        and not config["configurable"].get("in_coder_node", False)
-    ):
+    if use_multi_agent and not config["configurable"].get("in_coder_node", False):
         logger.info("Routing thread %s to Multi-Agent collaboration graph", thread_id)
         await ensure_sandbox_for_thread(thread_id)
         from .multi_agent.graph import get_multi_agent_graph
@@ -629,6 +754,10 @@ async def get_agent(config: RunnableConfig) -> Pregel:
             request_pr_review,
             slack_read_thread_messages,
             slack_thread_reply,
+            codegraph_search,
+            codegraph_callers,
+            codegraph_callees,
+            codegraph_impact,
         ],
         subagents=[_general_purpose_subagent(subagent_model)],
         backend=backend_factory,
