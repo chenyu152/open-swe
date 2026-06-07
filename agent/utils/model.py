@@ -41,6 +41,20 @@ _ANTHROPIC_EFFORTS: set[AnthropicEffort] = {"low", "medium", "high", "xhigh", "m
 
 def make_model(model_id: str, **kwargs: Unpack[ModelKwargs]):
     import os
+    from dotenv import load_dotenv
+
+    # Robustly find and load the .env file in project root
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    while cur_dir and not os.path.exists(os.path.join(cur_dir, ".env")):
+        parent = os.path.dirname(cur_dir)
+        if parent == cur_dir:
+            break
+        cur_dir = parent
+    env_path = os.path.join(cur_dir, ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=True)
+    else:
+        load_dotenv(override=True)
 
     # Dynamic mapping of DeepSeek credentials/endpoints
     if os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
@@ -82,10 +96,14 @@ def fallback_model_id_for(primary_model_id: str) -> str | None:
     when the provider has no configured cross-provider fallback (e.g. Google,
     local, or self-hosted providers we don't want to silently route off-host).
     """
+    import os
+
     if primary_model_id.startswith("anthropic:"):
-        return "openai:gpt-5.5"
+        if os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY"):
+            return "openai:gpt-5.5"
     if primary_model_id.startswith("openai:"):
-        return "anthropic:claude-opus-4-5"
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "anthropic:claude-opus-4-5"
     return None
 
 
