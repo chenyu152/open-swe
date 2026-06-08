@@ -18,8 +18,6 @@ After publish, the returned per-comment IDs get stored back on each Finding as
 the GraphQL ``resolveReviewThread`` mutation (REST doesn't expose this).
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import re
@@ -27,7 +25,14 @@ from typing import Any, TypedDict
 
 import httpx
 
-from .reviewer_findings import DiffSide, Finding, normalize_finding_title
+from .reviewer_findings import (
+    DiffSide,
+    Finding,
+    get_thread_metadata,
+    normalize_finding_title,
+    set_reviewer_thread_metadata,
+)
+from .utils.dashboard_links import dashboard_thread_url
 from .utils.github_token import GitHubAuthError
 
 logger = logging.getLogger(__name__)
@@ -221,22 +226,244 @@ def render_inline_comment_payload(finding: Finding) -> dict[str, Any] | None:
     return payload
 
 
-def render_review_body(*, pr_number: int, surfaced_count: int, trace_url: str | None = None) -> str:
+def review_summary_marker(pr_number: int) -> str:
+    """The hidden marker embedded in every Open SWE review summary body.
+
+    Used both to stamp the summary (``render_review_body``) and to detect
+    (``open_swe_review_exists``) whether Open SWE has already reviewed a PR.
+    """
+    return f"<!-- open-swe-reviewer pr={pr_number} -->"
+
+
+def render_out_of_diff_section(findings: list[Finding]) -> str:
+    """Render findings anchored outside the PR diff as a collapsed dropdown.
+
+    These can't be posted as inline comments (GitHub rejects off-diff lines), so
+    they live in the review summary body inside a ``<details>`` block — visible
+    on demand without adding noise to the changed-line review.
+    """
+    count = len(findings)
+    noun = "finding" if count == 1 else "findings"
+    items: list[str] = []
+    for f in findings:
+        title, detail = _split_title_and_detail(
+            (f.get("description") or "").strip(), f.get("title")
+        )
+        location = f.get("file") or "?"
+        line_ref = _format_line_reference(f.get("start_line"), f.get("end_line"))
+        if line_ref:
+            location += f" {line_ref.strip('*()')}".replace("Refers to ", "")
+        item = f"- {_severity_emoji(f.get('severity') or 'medium')} **{title}** — `{location}`"
+        if detail:
+            item += f"\n  {detail}"
+        items.append(item)
+    return (
+        f"<details>\n<summary>🔍 {count} out-of-diff {noun}</summary>\n\n"
+        "These relate to code outside this PR's changed lines.\n\n"
+        + "\n".join(items)
+        + "\n</details>"
+    )
+
+
+def render_review_body(
+    *,
+    pr_number: int,
+    surfaced_count: int,
+    trace_url: str | None = None,
+    ui_url: str | None = None,
+    out_of_diff_findings: list[Finding] | None = None,
+) -> str:
     """Compose the top-level review body."""
-    if surfaced_count == 0:
+    out_of_diff_findings = out_of_diff_findings or []
+    if surfaced_count == 0 and not out_of_diff_findings:
         headline = (
             "## ✅ Open SWE Review: No issues found\n\n"
             "Open SWE reviewed this PR and found no potential bugs to report."
         )
+    elif surfaced_count == 0:
+        headline = "**Open SWE Review** found no issues in the changed lines."
     else:
         issue_word = "issue" if surfaced_count == 1 else "issues"
         headline = f"**Open SWE Review** found {surfaced_count} potential {issue_word}."
 
     parts = [headline]
+    if out_of_diff_findings:
+        parts.append(render_out_of_diff_section(out_of_diff_findings))
+    links = []
+    if ui_url:
+        links.append(f"[Open in Web]({ui_url})")
     if trace_url:
-        parts.append(f"[View Open SWE trace]({trace_url})")
-    parts.append(f"<!-- open-swe-reviewer pr={pr_number} -->")
+        links.append(f"[View Open SWE trace]({trace_url})")
+    if links:
+        parts.append(" • ".join(links))
+    parts.append(review_summary_marker(pr_number))
     return "\n\n".join(parts)
+
+
+def status_comment_marker(pr_number: int) -> str:
+    """Hidden marker stamped on the live status comment for a PR."""
+    return f"<!-- open-swe-reviewer-status pr={pr_number} -->"
+
+
+def render_status_comment(
+    *,
+    pr_number: int,
+    thread_id: str | None = None,
+    trace_url: str | None = None,
+) -> str:
+    """Compose the transient "review in progress" comment.
+
+    Posted when a review starts so the PR shows activity and a clickable
+    "Open in Web" link while the run is live; deleted once ``publish_review``
+    posts the review (which carries the same link).
+    """
+    parts = ["## 🔍 Open SWE Review: in progress\n\nOpen SWE is reviewing this PR…"]
+    links = []
+    ui_url = dashboard_thread_url(thread_id) if thread_id else None
+    if ui_url:
+        links.append(f"[Open in Web]({ui_url})")
+    if trace_url:
+        links.append(f"[View Open SWE trace]({trace_url})")
+    if links:
+        parts.append(" • ".join(links))
+    parts.append(status_comment_marker(pr_number))
+    return "\n\n".join(parts)
+
+
+async def post_status_comment(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str,
+    token: str,
+) -> int | None:
+    """POST the live status comment to a PR. Returns its comment id or None."""
+    url = f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                url, headers=_github_headers(token), json={"body": body}, timeout=30
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("Failed to post status comment for %s/%s#%s", owner, repo, pr_number)
+            return None
+    data = response.json()
+    comment_id = data.get("id") if isinstance(data, dict) else None
+    return comment_id if isinstance(comment_id, int) else None
+
+
+async def delete_status_comment(
+    *,
+    owner: str,
+    repo: str,
+    comment_id: int,
+    token: str,
+) -> bool:
+    """DELETE a status comment by id. Returns True on success (or if gone)."""
+    url = f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/issues/comments/{comment_id}"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.delete(url, headers=_github_headers(token), timeout=30)
+            if response.status_code == 404:  # noqa: PLR2004
+                return True
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception("Failed to delete status comment %s on %s/%s", comment_id, owner, repo)
+            return False
+    return True
+
+
+async def post_review_started_comment(
+    *,
+    thread_id: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    token: str,
+    trace_url: str | None = None,
+) -> int | None:
+    """Post (or refresh) the transient "review in progress" comment.
+
+    Reuses the ``status_comment_id`` persisted in reviewer thread metadata when
+    one already lingers (a prior run that never settled), otherwise posts a
+    fresh comment and stores its id so ``clear_review_started_comment`` can
+    delete it once the review lands.
+    """
+    metadata = await get_thread_metadata(thread_id)
+    existing_id = metadata.get("status_comment_id")
+    if isinstance(existing_id, int):
+        await delete_status_comment(owner=owner, repo=repo, comment_id=existing_id, token=token)
+    body = render_status_comment(pr_number=pr_number, thread_id=thread_id, trace_url=trace_url)
+    new_id = await post_status_comment(
+        owner=owner, repo=repo, pr_number=pr_number, body=body, token=token
+    )
+    await set_reviewer_thread_metadata(thread_id, extra={"status_comment_id": new_id})
+    return new_id
+
+
+async def clear_review_started_comment(
+    *,
+    thread_id: str,
+    owner: str,
+    repo: str,
+    token: str,
+) -> None:
+    """Delete the transient "review in progress" comment, if one is tracked."""
+    metadata = await get_thread_metadata(thread_id)
+    comment_id = metadata.get("status_comment_id")
+    if not isinstance(comment_id, int):
+        return
+    await delete_status_comment(owner=owner, repo=repo, comment_id=comment_id, token=token)
+    await set_reviewer_thread_metadata(thread_id, extra={"status_comment_id": None})
+
+
+async def open_swe_review_exists(
+    *,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    token: str,
+) -> bool:
+    """Return True if Open SWE has already posted a review summary on this PR.
+
+    Detected via the ``review_summary_marker`` that ``render_review_body``
+    embeds in every Open SWE review body. The reviewer uses this to avoid
+    posting a duplicate "No issues found" summary when the ``re_review`` config
+    flag is stale — a push that lands mid-run is delivered as a queued message
+    into the still-running first-review run, whose configurable still says
+    ``re_review=False``, so the empty-review guard can't trust that flag alone.
+
+    On any API failure this returns False (fail open): the only consequence is
+    a possible duplicate summary, never a suppressed first review.
+    """
+    marker = review_summary_marker(pr_number)
+    url = f"{_GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    headers = _github_headers(token)
+    params: dict[str, Any] = {"per_page": 100, "page": 1}
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                response = await client.get(url, headers=headers, params=params, timeout=30)
+                response.raise_for_status()
+            except httpx.HTTPError:
+                logger.exception(
+                    "Failed to list PR reviews for %s/%s#%s",
+                    owner,
+                    repo,
+                    pr_number,
+                )
+                return False
+            data = response.json()
+            if not isinstance(data, list) or not data:
+                return False
+            for review in data:
+                if isinstance(review, dict) and marker in (review.get("body") or ""):
+                    return True
+            if len(data) < 100:  # noqa: PLR2004
+                return False
+            params["page"] += 1
 
 
 async def post_pull_request_review(
@@ -447,12 +674,21 @@ async def fetch_pr_review_threads(
                 )
                 return out
             data = response.json()
-            threads = (
-                data.get("data", {})
-                .get("repository", {})
-                .get("pullRequest", {})
-                .get("reviewThreads", {})
-            )
+            data_root = data.get("data") if isinstance(data, dict) else None
+            repository = data_root.get("repository") if isinstance(data_root, dict) else None
+            if not isinstance(repository, dict):
+                logger.warning(
+                    "Null repository in review-threads response for %s/%s#%s "
+                    "(token likely lacks access: SAML, expired token, or private/deleted repo)",
+                    owner,
+                    repo,
+                    pr_number,
+                )
+                return out
+            pull_request = repository.get("pullRequest")
+            threads = pull_request.get("reviewThreads") if isinstance(pull_request, dict) else None
+            if not isinstance(threads, dict):
+                return out
             for thread in threads.get("nodes", []) or []:
                 if not isinstance(thread, dict):
                     continue
@@ -612,8 +848,10 @@ async def resolve_review_thread(*, thread_node_id: str, token: str) -> bool:
     if data.get("errors"):
         logger.warning("resolveReviewThread errors: %s", data["errors"])
         return False
-    thread = data.get("data", {}).get("resolveReviewThread", {}).get("thread", {})
-    return bool(thread.get("isResolved"))
+    data_root = data.get("data") if isinstance(data, dict) else None
+    resolved = data_root.get("resolveReviewThread") if isinstance(data_root, dict) else None
+    thread = resolved.get("thread") if isinstance(resolved, dict) else None
+    return bool(thread.get("isResolved")) if isinstance(thread, dict) else False
 
 
 async def reply_to_review_comment(

@@ -286,7 +286,7 @@ Users can also override the team/project mapping per-comment by including `repo:
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**
 2. Copy the manifest below, replacing the two placeholder URLs:
    - Replace `<your-provider-id>` with the OAuth provider ID from step 3a
-   - Replace `<your-ngrok-url>` with the ngrok URL from step 2
+   - Replace `<your-ngrok-url>` with the backend URL from step 2 (or your deployed LangGraph/FastAPI URL in production)
 
 <details>
 <summary>Slack App Manifest</summary>
@@ -343,6 +343,10 @@ Users can also override the team/project mapping per-comment by including `repo:
                 "message.mpim"
             ]
         },
+        "interactivity": {
+            "is_enabled": true,
+            "request_url": "https://<your-ngrok-url>/webhooks/slack/interactivity"
+        },
         "org_deploy_enabled": false,
         "socket_mode_enabled": false,
         "token_rotation_enabled": false
@@ -353,6 +357,15 @@ Users can also override the team/project mapping per-comment by including `repo:
 </details>
 
 3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-...`)
+
+**Slack URL checklist:**
+
+Both Slack URLs must point at the Open SWE backend that serves `agent.webapp:app` (locally, your ngrok URL forwarding to `langgraph dev`; in production, your LangGraph/FastAPI deployment URL), not the dashboard frontend URL.
+
+- **Event Subscriptions → Request URL:** `https://<your-backend-url>/webhooks/slack`
+- **Interactivity & Shortcuts → Interactivity Request URL:** `https://<your-backend-url>/webhooks/slack/interactivity`
+
+Slack Block Kit option buttons only work when Interactivity is enabled and pointed at `/webhooks/slack/interactivity`.
 
 **Credentials you'll need:**
 
@@ -392,6 +405,7 @@ LANGSMITH_URL_PROD="https://smith.langchain.com"
 ANTHROPIC_API_KEY=""                   # Anthropic API key
 OPENAI_API_KEY=""                      # OpenAI API key (when using openai: models)
 GOOGLE_API_KEY=""                      # Google AI API key (when using google_genai: models)
+FIREWORKS_API_KEY=""                   # Fireworks API key (when using fireworks: models)
 
 # === GitHub App (required) ===
 GITHUB_APP_ID=""                       # From step 3c
@@ -443,7 +457,7 @@ DEFAULT_REPO_NAME=""                   # Default GitHub repo (e.g. "my-repo")
 DASHBOARD_API_BASE_URL="http://localhost:2024"
 # Public base URL of the dashboard frontend (the ui/ app). Default post-login redirect.
 DASHBOARD_BASE_URL="http://localhost:3000"
-# HMAC secret for all dashboard JWTs (session cookie, OAuth state, account-link tokens).
+# HMAC secret for dashboard JWTs (session cookie and OAuth state).
 DASHBOARD_JWT_SECRET=""                # Generate with: openssl rand -hex 32
 # Comma-separated origins allowed for credentialed CORS and post-login redirects.
 # Required whenever the frontend and API are on different origins — including local
@@ -539,6 +553,7 @@ make dev          # uv run langgraph dev
 | `POST /webhooks/linear` | Linear comment webhooks |
 | `GET /webhooks/linear` | Linear webhook verification |
 | `POST /webhooks/slack` | Slack event webhooks |
+| `POST /webhooks/slack/interactivity` | Slack Block Kit button interactions |
 | `GET /webhooks/slack` | Slack webhook verification |
 | `GET /dashboard/api/auth/login` | Dashboard GitHub OAuth login |
 | `GET /dashboard/api/auth/callback` | Dashboard GitHub OAuth callback (registered on the App in step 3b) |

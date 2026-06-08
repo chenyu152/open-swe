@@ -10,6 +10,7 @@ class ModelOption(TypedDict):
     label: str
     efforts: list[str]
     default_effort: str
+    supports_images: bool
 
 
 SUPPORTED_MODELS: list[ModelOption] = [
@@ -18,12 +19,54 @@ SUPPORTED_MODELS: list[ModelOption] = [
         "label": "Opus 4.8",
         "efforts": ["low", "medium", "high", "xhigh", "max"],
         "default_effort": "high",
+        "supports_images": True,
     },
     {
         "id": "openai:gpt-5.5",
         "label": "GPT-5.5",
-        "efforts": ["low", "medium", "high", "xhigh"],
+        "efforts": ["none", "low", "medium", "high", "xhigh"],
         "default_effort": "xhigh",
+        "supports_images": True,
+    },
+    {
+        "id": "google_genai:gemini-3.5-flash",
+        "label": "Gemini 3.5 Flash",
+        "efforts": ["minimal", "low", "medium", "high"],
+        "default_effort": "medium",
+        "supports_images": True,
+    },
+    {
+        "id": "fireworks:accounts/fireworks/models/kimi-k2p6",
+        "label": "Kimi K2.6",
+        "efforts": ["none", "low", "medium", "high"],
+        "default_effort": "high",
+        "supports_images": False,
+    },
+    {
+        "id": "fireworks:accounts/fireworks/models/deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro",
+        "efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+        "default_effort": "high",
+        "supports_images": False,
+    },
+    {
+        "id": "fireworks:accounts/fireworks/models/glm-5p1",
+        "label": "GLM 5.1",
+        "efforts": ["none", "low", "medium", "high"],
+        "default_effort": "high",
+        "supports_images": False,
+    },
+    {
+        "id": "openai:deepseek-v4-flash",
+        "label": "DeepSeek v4 Flash",
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
+    },
+    {
+        "id": "openai:deepseek-v4-pro",
+        "label": "DeepSeek v4 Pro",
+        "efforts": ["low", "medium", "high"],
+        "default_effort": "medium",
     },
 ]
 
@@ -40,9 +83,30 @@ def model_supports_effort(model_id: str, effort: str) -> bool:
     return False
 
 
+def model_supports_images(model_id: str) -> bool:
+    for m in SUPPORTED_MODELS:
+        if m["id"] == model_id:
+            return m["supports_images"]
+    return False
+
+
 def _provider_of(model_id: str) -> str | None:
     provider, _, rest = model_id.partition(":")
     return provider if rest else None
+
+
+def _fallback_effort_for(model: ModelOption, effort: object) -> str | None:
+    if not isinstance(effort, str):
+        return None
+    if effort in model["efforts"]:
+        return effort
+    if (
+        model["id"].startswith("google_genai:")
+        and effort == "none"
+        and "minimal" in model["efforts"]
+    ):
+        return "minimal"
+    return None
 
 
 def provider_fallback_pair(model_id: object, effort: object = None) -> tuple[str, str] | None:
@@ -61,8 +125,7 @@ def provider_fallback_pair(model_id: object, effort: object = None) -> tuple[str
         return None
     for m in SUPPORTED_MODELS:
         if _provider_of(m["id"]) == provider:
-            new_effort = effort if (isinstance(effort, str) and effort in m["efforts"]) else None
-            return m["id"], new_effort or m["default_effort"]
+            return m["id"], _fallback_effort_for(m, effort) or m["default_effort"]
     return None
 
 

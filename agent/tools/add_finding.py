@@ -20,6 +20,7 @@ from ..reviewer_findings import (
     get_thread_id_from_runtime,
     new_finding,
     normalize_finding_title,
+    resolve_review_head_sha,
 )
 
 
@@ -112,19 +113,11 @@ def add_finding(
     config = get_config()
     configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
     diff_line_set = configurable.get("diff_line_set") if isinstance(configurable, dict) else None
-    head_sha = configurable.get("head_sha", "") if isinstance(configurable, dict) else ""
     diff_text = configurable.get("diff_text", "") if isinstance(configurable, dict) else ""
 
-    if isinstance(diff_line_set, dict) and not is_range_in_diff(
+    in_diff = not isinstance(diff_line_set, dict) or is_range_in_diff(
         diff_line_set, file, start_line, end_line, side=_cast_side(side)
-    ):
-        return {
-            "success": False,
-            "error": (
-                f"Finding range {file}:{start_line}-{end_line} is not part of the PR diff. "
-                "Only review changes the PR introduces; do not flag pre-existing code."
-            ),
-        }
+    )
 
     diff_hunk: str | None = None
     if isinstance(diff_text, str) and diff_text:
@@ -134,6 +127,9 @@ def add_finding(
 
     clipped_suggestion, suggestion_dropped = clip_suggestion(suggestion)
 
+    thread_id = get_thread_id_from_runtime()
+    head_sha = asyncio.run(resolve_review_head_sha(thread_id, configurable))
+
     finding: Finding = new_finding(
         severity=_cast_severity(severity),
         confidence=_cast_confidence(confidence),
@@ -142,16 +138,23 @@ def add_finding(
         start_line=start_line,
         end_line=end_line,
         description=description,
-        sha=str(head_sha) if isinstance(head_sha, str) else "",
+        sha=head_sha,
         title=normalized_title,
         side=_cast_side(side),
         suggestion=clipped_suggestion,
         diff_hunk=diff_hunk,
+        in_diff=in_diff,
     )
 
-    thread_id = get_thread_id_from_runtime()
     asyncio.run(append_finding(thread_id, finding))
     result: dict[str, Any] = {"success": True, "finding_id": finding["id"]}
+    if not in_diff:
+        result["in_diff"] = False
+        result["note"] = (
+            "Anchored outside the PR diff. This will be surfaced in the collapsed "
+            "out-of-diff section of the review summary, not as an inline comment. "
+            "Do not re-anchor or retry."
+        )
     if suggestion_dropped:
         result["suggestion_dropped"] = True
         result["warning"] = (

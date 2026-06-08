@@ -1,37 +1,54 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
+import type { SessionUser } from "@/lib/api";
+import type { PendingPrompt } from "@/lib/agents/pendingPrompts";
+import type { AgentThread, Message } from "@/lib/agents/types";
+import type { ModelSelection } from "@/lib/agents/useModelOptions";
 import { AgentPromptBar } from "@/components/agents/AgentPromptBar";
 import { AgentsShell } from "@/components/agents/AgentsSidebar";
-import {
-  MessageView,
-  summarizeChangedFiles,
-  type MessageViewScrollControl,
-} from "@/components/agents/ported";
-import type { SessionUser } from "@/lib/api";
-import type { AgentThread, Message } from "@/lib/agents/types";
-import { useSendAgentMessage } from "@/lib/agents/queries";
-import {
-  dropPendingPrompts,
-  getPendingPrompts,
-  type PendingPrompt,
-} from "@/lib/agents/pendingPrompts";
+import { MessageView } from "@/components/agents/ported";
+import { useCancelAgentThread, useSendAgentMessage } from "@/lib/agents/queries";
+import { dropPendingPrompts, getPendingPrompts } from "@/lib/agents/pendingPrompts";
 import { useAgentThreadStream } from "@/lib/agents/useThreadStream";
-import { useModelOptions, type ModelSelection } from "@/lib/agents/useModelOptions";
+import { useModelOptions } from "@/lib/agents/useModelOptions";
 
 interface AgentThreadViewProps {
   user: SessionUser;
   thread: AgentThread;
 }
 
-const PROMPT_OVERLAY_INSET = 128;
+function messageText(message: Message): string {
+  return message.chunks
+    .filter((chunk) => chunk.kind === "text")
+    .map((chunk) => chunk.text)
+    .join("");
+}
+
+function messageImageKey(message: Message): string {
+  return message.chunks
+    .filter((chunk) => chunk.kind === "image")
+    .map((chunk) => `${chunk.mimeType}:${chunk.base64}`)
+    .join("\u0000");
+}
+
+function pendingImageKey(entry: PendingPrompt): string {
+  return (entry.images ?? [])
+    .map((image) => `${image.mimeType}:${image.base64}`)
+    .join("\u0000");
+}
+
+function isPendingPromptConfirmed(entry: PendingPrompt, messages: Array<Message>): boolean {
+  return messages.slice(entry.insertAt).some((message) => {
+    if (message.author !== "user") return false;
+    return messageText(message) === entry.prompt && messageImageKey(message) === pendingImageKey(entry);
+  });
+}
 
 export function AgentThreadView({ user, thread }: AgentThreadViewProps) {
   const sendMessage = useSendAgentMessage(thread.id);
+  const cancelThread = useCancelAgentThread(thread.id);
   useAgentThreadStream(thread.id, thread.status === "running");
-  const scrollControlRef = useRef<MessageViewScrollControl | null>(null);
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
-  const [pendingPrompts, setPendingPrompts] = useState<PendingPrompt[]>(() =>
+  const [pendingPrompts, setPendingPrompts] = useState<Array<PendingPrompt>>(() =>
     getPendingPrompts(thread.id),
   );
 
@@ -45,46 +62,30 @@ export function AgentThreadView({ user, thread }: AgentThreadViewProps) {
     return { modelId: thread.model, effort: thread.effort };
   }, [models, thread.model, thread.effort]);
   const [selection, setSelection] = useState<ModelSelection | null>(null);
-
-  useEffect(() => {
-    if (selection !== null) return;
-    if (threadSelection) setSelection(threadSelection);
-    else if (defaultSelection) setSelection(defaultSelection);
-  }, [defaultSelection, selection, threadSelection]);
-
-  const userMessageTexts = useMemo(() => {
-    return new Set(
-      thread.messages
-        .filter((m) => m.author === "user")
-        .map((m) =>
-          m.chunks
-            .filter((c) => c.kind === "text")
-            .map((c) => (c as { kind: "text"; text: string }).text)
-            .join(""),
-        ),
-    );
-  }, [thread.messages]);
+  const activeSelection = selection ?? threadSelection ?? defaultSelection;
 
   useEffect(() => {
     setPendingPrompts((prev) => {
       if (prev.length === 0) return prev;
       const next = dropPendingPrompts(thread.id, (entry) =>
-        userMessageTexts.has(entry.prompt),
+        isPendingPromptConfirmed(entry, thread.messages),
       );
       return next.length === prev.length ? prev : next;
     });
-  }, [thread.id, userMessageTexts]);
+  }, [thread.id, thread.messages]);
 
-  const displayMessages = useMemo<Message[]>(() => {
+  const displayMessages = useMemo<Array<Message>>(() => {
     if (pendingPrompts.length === 0) return thread.messages;
     const baseTimestamp = new Date().toISOString();
     const result = thread.messages.slice();
     pendingPrompts.forEach((entry, i) => {
+      const chunks: Message["chunks"] = [...(entry.images ?? [])];
+      if (entry.prompt) chunks.push({ kind: "text", text: entry.prompt });
       const synth: Message = {
         id: `pending-user-${i}`,
         author: "user",
         timestamp: baseTimestamp,
-        chunks: [{ kind: "text", text: entry.prompt }],
+        chunks,
       };
       const at = Math.min(Math.max(entry.insertAt, 0), result.length);
       result.splice(at, 0, synth);
@@ -92,81 +93,40 @@ export function AgentThreadView({ user, thread }: AgentThreadViewProps) {
     return result;
   }, [thread.messages, pendingPrompts]);
 
-  const changedFiles = useMemo(() => {
-    const agentMessages = thread.messages.filter((m) => m.author === "agent");
-    const allChunks = agentMessages.flatMap((m) => m.chunks);
-    return summarizeChangedFiles(allChunks);
-  }, [thread.messages]);
-
   const hasMessages = displayMessages.length > 0;
-  const isStreaming = thread.status === "running" || pendingPrompts.length > 0;
+  const hasActiveRun = thread.status === "running";
+  const isStreaming = hasActiveRun || pendingPrompts.length > 0;
 
   return (
     <AgentsShell user={user} activeThreadId={thread.id}>
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex min-h-0 flex-1 flex-col">
           {hasMessages ? (
-            <div className="relative flex min-h-0 flex-1 flex-col">
-              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-                <MessageView
-                  messages={displayMessages}
-                  isStreaming={isStreaming}
-                  contentWidthClass="max-w-3xl"
-                  bottomInset={PROMPT_OVERLAY_INSET}
-                  scrollButtonSlot="external"
-                  scrollControlRef={scrollControlRef}
-                  onShowScrollToBottomChange={setShowScrollToBottom}
-                />
-
-                {changedFiles.length > 0 && (
-                  <div className="mx-auto mt-4 w-full max-w-3xl shrink-0 px-6">
-                    <div className="rounded-lg border border-[var(--ui-border)] bg-[var(--ui-panel)] p-3">
-                      <div className="mb-2 text-xs font-medium text-[var(--ui-text-muted)]">
-                        {changedFiles.length} Files Changed
-                      </div>
-                      <div className="space-y-1">
-                        {changedFiles.map((file) => (
-                          <div
-                            key={file.filePath}
-                            className="flex items-center justify-between rounded px-2 py-1 text-xs hover:bg-[var(--ui-panel-2)]"
-                          >
-                            <span className="font-mono text-[var(--ui-text)]">{file.filePath}</span>
-                            <span className="text-[var(--ui-success)]">+{file.additions}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 px-6 pb-4">
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-[var(--ui-bg)] via-[var(--ui-bg)]/80 to-transparent" />
-                <div className="pointer-events-auto relative mx-auto max-w-3xl">
-                  {showScrollToBottom && (
-                    <button
-                      type="button"
-                      onClick={() => scrollControlRef.current?.scrollToBottom()}
-                      aria-label="Scroll to bottom"
-                      className="absolute bottom-full left-1/2 z-30 mb-2 inline-flex h-8 w-8 -translate-x-1/2 items-center justify-center rounded-full bg-[var(--ui-panel-2)] text-[color:var(--ui-text-muted)] shadow-md transition-colors hover:bg-[var(--ui-panel)] hover:text-[color:var(--ui-text)]"
-                    >
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    </button>
-                  )}
+            <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+              <MessageView
+                messages={displayMessages}
+                isStreaming={isStreaming}
+                contentWidthClass="max-w-3xl"
+              />
+              <div className="shrink-0 px-4 pb-4">
+                <div className="mx-auto w-full min-w-0 max-w-3xl">
                   <AgentPromptBar
                     placeholder="Add a follow up"
                     compact
-                    busy={isStreaming}
+                    busy={hasActiveRun}
                     disabled={sendMessage.isPending}
-                    onSubmit={(content) =>
+                    onSubmit={(content, images) =>
                       sendMessage.mutate({
                         content,
-                        model_id: selection?.modelId ?? null,
-                        effort: selection?.effort ?? null,
+                        images,
+                        model_id: activeSelection?.modelId ?? null,
+                        effort: activeSelection?.effort ?? null,
                       })
                     }
+                    onStop={() => cancelThread.mutate()}
+                    stopping={cancelThread.isPending}
                     models={models}
-                    selection={selection ?? threadSelection ?? defaultSelection}
+                    selection={activeSelection}
                     onSelectionChange={setSelection}
                   />
                 </div>
@@ -179,17 +139,20 @@ export function AgentThreadView({ user, thread }: AgentThreadViewProps) {
                 <AgentPromptBar
                   placeholder="Send the first message"
                   compact
-                  busy={isStreaming}
+                  busy={hasActiveRun}
                   disabled={sendMessage.isPending}
-                  onSubmit={(content) =>
+                  onSubmit={(content, images) =>
                     sendMessage.mutate({
                       content,
-                      model_id: selection?.modelId ?? null,
-                      effort: selection?.effort ?? null,
+                      images,
+                      model_id: activeSelection?.modelId ?? null,
+                      effort: activeSelection?.effort ?? null,
                     })
                   }
+                  onStop={() => cancelThread.mutate()}
+                  stopping={cancelThread.isPending}
                   models={models}
-                  selection={selection ?? threadSelection ?? defaultSelection}
+                  selection={activeSelection}
                   onSelectionChange={setSelection}
                 />
               </div>

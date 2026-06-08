@@ -1,5 +1,6 @@
-"""Custom FastAPI routes for LangGraph server."""
-
+import asyncio
+from dotenv import load_dotenv
+load_dotenv()
 import hashlib
 import hmac
 import json
@@ -7,10 +8,10 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -27,7 +28,7 @@ from .dashboard.agent_overrides import (
 from .dashboard.enabled_repos import is_review_repo_enabled
 from .dashboard.oauth import build_settings_url
 from .dashboard.profiles import get_profile, get_valid_access_token, has_access_token_record
-from .dashboard.team_settings import get_team_settings
+from .dashboard.team_settings import get_team_default_repo, get_team_settings
 from .dashboard.user_mappings import (
     email_for_login,
     login_for_email,
@@ -48,14 +49,12 @@ from .reviewer_findings import (
 from .reviewer_findings import (
     list_findings as list_reviewer_findings,
 )
-from .reviewer_publish import fetch_pr_review_threads
+from .reviewer_publish import fetch_pr_review_threads, post_review_started_comment
 from .reviewer_reconcile import reconcile_findings_with_review_threads
 from .utils.auth import (
     is_bot_token_only_mode,
-    persist_encrypted_github_token,
     resolve_github_token_from_email,
 )
-from .utils.authorship import OPEN_SWE_BOT_NAME
 from .utils.comments import get_recent_comments
 from .utils.github_app import (
     get_github_app_installation_token,
@@ -70,25 +69,26 @@ from .utils.github_comments import (
     fetch_pr_comments_since_last_tag,
     format_github_comment_body_for_prompt,
     get_thread_id_from_branch,
-    parse_github_review_command,
     react_to_github_comment,
     sanitize_github_comment_body,
     verify_github_signature,
 )
 from .utils.github_org_membership import INTERNAL_BOT_LOGINS, is_user_active_org_member
-from .utils.github_token import get_github_token_from_thread, invalidate_cached_github_token
+from .utils.github_token import (
+    cache_github_token_for_thread,
+    get_github_token_from_thread,
+    invalidate_cached_github_token,
+)
 from .utils.linear import post_linear_trace_comment
 from .utils.linear_team_repo_map import LINEAR_TEAM_TO_REPO
 from .utils.multimodal import dedupe_urls, extract_image_urls, fetch_image_block
 from .utils.repo import extract_repo_from_text
-from .utils.sandbox import validate_sandbox_startup_config
 from .utils.slack import (
     GitHubPrRef,
     fetch_slack_thread_messages,
     format_slack_messages_for_prompt,
     get_slack_user_info,
     get_slack_user_names,
-    parse_github_pr_url,
     post_slack_thread_reply,
     post_slack_trace_reply,
     resolve_slack_links_in_context,
@@ -110,8 +110,20 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    from .dashboard.agent_usage import run_usage_cache_warmer, usage_cache_warmer_enabled
+    from .utils.sandbox import validate_sandbox_startup_config
+
     validate_sandbox_startup_config()
-    yield
+    usage_cache_task: asyncio.Task[None] | None = None
+    if usage_cache_warmer_enabled():
+        usage_cache_task = asyncio.create_task(run_usage_cache_warmer(), name="usage-cache-warmer")
+    try:
+        yield
+    finally:
+        if usage_cache_task:
+            usage_cache_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await usage_cache_task
 
 
 app = FastAPI(lifespan=lifespan)
@@ -130,13 +142,369 @@ if DASHBOARD_ALLOWED_ORIGINS:
 
 app.include_router(dashboard_router)
 
+# ==============================================================================
+# ENTERPRISE SECURITY GATEWAY & AUDIT TRAIL ENDPOINTS
+# ==============================================================================
+import sqlite3
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+
+class ApprovalRequest(BaseModel):
+    approval_id: int
+    status: str  # 'APPROVED' or 'REJECTED'
+
+@app.get("/safety/approvals")
+async def list_approvals():
+    """Retrieve all safety approvals (pending and resolved)."""
+    from .utils.sandbox_safety import DB_PATH
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, timestamp, command, risk_level, reason, status FROM approvals ORDER BY id DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        approvals = []
+        for r in rows:
+            approvals.append({
+                "id": r[0],
+                "timestamp": r[1],
+                "command": r[2],
+                "risk_level": r[3],
+                "reason": r[4],
+                "status": r[5]
+            })
+        return {"approvals": approvals}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/safety/audit")
+async def list_audit_trail():
+    """Retrieve the complete sandbox safety command execution history (audit trail)."""
+    from .utils.sandbox_safety import DB_PATH
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, timestamp, command, risk_level, reason, duration, exit_code FROM audit_trail ORDER BY id DESC")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        audit = []
+        for r in rows:
+            audit.append({
+                "id": r[0],
+                "timestamp": r[1],
+                "command": r[2],
+                "reason": r[4],
+                "risk_level": r[3],
+                "duration": r[5],
+                "exit_code": r[6]
+            })
+        return {"audit": audit}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/safety/approve")
+async def approve_command(req: ApprovalRequest):
+    """Approve or reject a pending command."""
+    from .utils.sandbox_safety import DB_PATH
+    if req.status not in ("APPROVED", "REJECTED"):
+        raise HTTPException(status_code=400, detail="Invalid status. Must be APPROVED or REJECTED.")
+        
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Verify it exists
+        cursor.execute("SELECT status FROM approvals WHERE id = ?", (req.approval_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Approval ID {req.approval_id} not found.")
+            
+        if row[0] != "PENDING":
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"Approval ID {req.approval_id} is already resolved to {row[0]}.")
+            
+        cursor.execute("UPDATE approvals SET status = ? WHERE id = ?", (req.status, req.approval_id))
+        conn.commit()
+        conn.close()
+        
+        return {"status": "success", "message": f"Command {req.approval_id} has been {req.status}."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/safety/approvals/ui", response_class=HTMLResponse)
+async def approvals_dashboard():
+    """Render a premium dark-mode developer console for safety audit and approvals."""
+    html_content = """
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Open-SWE Enterprise - Safety Shield Dashboard</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+                        mono: ['"JetBrains Mono"', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #09090b;
+            color: #fafafa;
+        }
+        .glass {
+            background: rgba(18, 18, 24, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .glow-pending {
+            box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);
+        }
+    </style>
+</head>
+<body class="font-sans antialiased min-h-screen pb-12">
+    <!-- Header -->
+    <header class="border-b border-zinc-800 bg-zinc-950/60 sticky top-0 z-50 backdrop-blur-md">
+        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <span class="p-2 bg-amber-500/10 text-amber-500 rounded-lg border border-amber-500/20">🛡️</span>
+                <div>
+                    <h1 class="text-md font-bold tracking-tight text-white flex items-center gap-2">
+                        Open-SWE <span class="text-xs px-2 py-0.5 bg-amber-500/20 text-amber-400 font-semibold rounded-full border border-amber-500/30">Enterprise Shield</span>
+                    </h1>
+                    <p class="text-xs text-zinc-400">Sandbox Command Security Gateway & Audit Trail</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-4">
+                <div class="flex items-center gap-2 text-xs text-zinc-400 bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-lg">
+                    <span class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
+                    <span>Monitoring active sandboxes</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-6 mt-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Main Column: Approvals Queue -->
+        <div class="lg:col-span-2 space-y-6">
+            <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                📥 Safety Approvals Queue
+                <span id="pending-badge" class="hidden text-xs px-2 py-0.5 bg-amber-500/20 text-amber-400 font-semibold rounded-full border border-amber-500/30"></span>
+            </h2>
+            
+            <div id="approvals-container" class="space-y-4">
+                <!-- Dynamically populated approvals -->
+                <div class="text-center py-12 border border-zinc-800 rounded-xl bg-zinc-950/30 text-zinc-400 text-sm">
+                    Loading safety queue...
+                </div>
+            </div>
+        </div>
+
+        <!-- Sidebar: Audit Trails & Stats -->
+        <div class="space-y-6">
+            <h2 class="text-lg font-semibold text-white flex items-center gap-2">
+                📊 Audit Analytics
+            </h2>
+            
+            <!-- Quick Stats -->
+            <div class="grid grid-cols-2 gap-4">
+                <div class="glass p-4 rounded-xl">
+                    <p class="text-xs text-zinc-400">Total Intercepted</p>
+                    <p id="stat-total" class="text-2xl font-bold text-white mt-1">0</p>
+                </div>
+                <div class="glass p-4 rounded-xl">
+                    <p class="text-xs text-zinc-400">Blocked (High)</p>
+                    <p id="stat-high" class="text-2xl font-bold text-rose-500 mt-1">0</p>
+                </div>
+            </div>
+
+            <h2 class="text-lg font-semibold text-white flex items-center gap-2 mt-8">
+                📜 Command Audit Trail
+            </h2>
+            <div class="glass rounded-xl overflow-hidden border border-zinc-800">
+                <div class="max-h-[500px] overflow-y-auto divide-y divide-zinc-800" id="audit-container">
+                    <div class="text-center py-8 text-zinc-500 text-xs">
+                        Loading audit trails...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- JS Logic -->
+    <script>
+        async function fetchDashboardData() {
+            try {
+                // Fetch approvals
+                const appRes = await fetch('/safety/approvals');
+                const appData = await appRes.json();
+                
+                // Fetch audit trail
+                const auditRes = await fetch('/safety/audit');
+                const auditData = await auditRes.json();
+                
+                renderApprovals(appData.approvals);
+                renderAuditTrail(auditData.audit);
+                renderStats(auditData.audit);
+            } catch (err) {
+                console.error("Failed to load dashboard data", err);
+            }
+        }
+
+        function renderApprovals(approvals) {
+            const container = document.getElementById('approvals-container');
+            const pendingBadge = document.getElementById('pending-badge');
+            
+            const pending = approvals.filter(a => a.status === 'PENDING');
+            if (pending.length > 0) {
+                pendingBadge.classList.remove('hidden');
+                pendingBadge.innerText = `${pending.length} Pending`;
+            } else {
+                pendingBadge.classList.add('hidden');
+            }
+
+            if (approvals.length === 0) {
+                container.innerHTML = `
+                    <div class="text-center py-12 border border-zinc-800 rounded-xl bg-zinc-950/30 text-zinc-500 text-sm">
+                        No commands in safety queue. Safe coding environment active!
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = approvals.map(appr => {
+                const isPending = appr.status === 'PENDING';
+                let statusColor = "bg-zinc-800 text-zinc-400 border-zinc-700";
+                if (appr.status === 'APPROVED') statusColor = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
+                if (appr.status === 'REJECTED') statusColor = "bg-rose-500/10 text-rose-400 border-rose-500/20";
+                if (appr.status === 'TIMEOUT') statusColor = "bg-zinc-800 text-zinc-400 border-zinc-700";
+
+                const riskColor = appr.risk_level === 'HIGH' ? 'text-rose-500 bg-rose-500/10 border-rose-500/20' : 'text-amber-500 bg-amber-500/10 border-amber-500/20';
+
+                return `
+                    <div class="glass p-5 rounded-xl transition-all duration-300 ${isPending ? 'border-amber-500/30 glow-pending animate-pulse' : ''}">
+                        <div class="flex items-center justify-between gap-4 flex-wrap">
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs px-2.5 py-1 rounded-full font-semibold border ${statusColor}">
+                                    ${appr.status}
+                                </span>
+                                <span class="text-xs px-2.5 py-1 rounded-full font-semibold border ${riskColor}">
+                                    ${appr.risk_level} Risk
+                                </span>
+                                <span class="text-xs text-zinc-500">${appr.timestamp}</span>
+                            </div>
+                            ${isPending ? `
+                                <div class="flex items-center space-x-2">
+                                    <button onclick="resolveApproval(${appr.id}, 'APPROVED')" class="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs rounded-lg transition-colors shadow-md shadow-emerald-950/20">
+                                        Approve
+                                    </button>
+                                    <button onclick="resolveApproval(${appr.id}, 'REJECTED')" class="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs rounded-lg transition-colors shadow-md shadow-rose-950/20">
+                                        Reject
+                                    </button>
+                                </div>
+                            ` : ''}
+                        </div>
+                        <div class="mt-4">
+                            <p class="text-xs text-zinc-400 font-semibold mb-1">Command String</p>
+                            <pre class="bg-zinc-950 border border-zinc-800 p-3 rounded-lg font-mono text-sm text-zinc-200 overflow-x-auto">${appr.command}</pre>
+                        </div>
+                        <div class="mt-3 text-xs text-zinc-400">
+                            <span class="font-semibold text-zinc-300">Reasoning:</span> ${appr.reason || "N/A"}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderAuditTrail(audit) {
+            const container = document.getElementById('audit-container');
+            if (audit.length === 0) {
+                container.innerHTML = `
+                    <div class="text-center py-8 text-zinc-500 text-xs">
+                        No audit trails recorded yet.
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = audit.map(aud => {
+                const exitColor = aud.exit_code === 0 ? 'text-emerald-500' : 'text-rose-500';
+                const riskColor = aud.risk_level === 'HIGH' ? 'text-rose-500 bg-rose-500/10' : (aud.risk_level === 'MEDIUM' ? 'text-amber-500 bg-amber-500/10' : 'text-zinc-500 bg-zinc-800');
+                const durationText = aud.duration ? `${aud.duration.toFixed(2)}s` : 'N/A';
+                
+                return `
+                    <div class="p-3 text-xs space-y-1 hover:bg-zinc-900/50 transition-colors">
+                        <div class="flex items-center justify-between">
+                            <span class="px-1.5 py-0.5 rounded font-mono text-[10px] ${riskColor}">${aud.risk_level}</span>
+                            <span class="text-[10px] text-zinc-500">${aud.timestamp}</span>
+                        </div>
+                        <div class="font-mono text-zinc-300 break-all select-all">${aud.command}</div>
+                        <div class="flex items-center justify-between text-[10px] text-zinc-500">
+                            <span>Duration: ${durationText}</span>
+                            <span class="${exitColor}">Exit: ${aud.exit_code}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function renderStats(audit) {
+            document.getElementById('stat-total').innerText = audit.length;
+            document.getElementById('stat-high').innerText = audit.filter(a => a.risk_level === 'HIGH').length;
+        }
+
+        async function resolveApproval(id, status) {
+            try {
+                const res = await fetch('/safety/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ approval_id: id, status: status })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    fetchDashboardData();
+                } else {
+                    alert(data.detail || "Error resolving approval.");
+                }
+            } catch (err) {
+                console.error(err);
+                alert("Failed to connect to safety server.");
+            }
+        }
+
+        // Poll every 2 seconds
+        fetchDashboardData();
+        setInterval(fetchDashboardData, 2000);
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 LINEAR_WEBHOOK_SECRET = os.environ.get("LINEAR_WEBHOOK_SECRET", "")
 GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 SLACK_BOT_USER_ID = os.environ.get("SLACK_BOT_USER_ID", "")
 SLACK_BOT_USERNAME = os.environ.get("SLACK_BOT_USERNAME", "")
 DEFAULT_REPO_OWNER = os.environ.get("DEFAULT_REPO_OWNER", "langchain-ai")
-DEFAULT_REPO_NAME = os.environ.get("DEFAULT_REPO_NAME", "langchainplus")
+DEFAULT_REPO_NAME = os.environ.get("DEFAULT_REPO_NAME", "")
 SLACK_REPO_OWNER = os.environ.get("SLACK_REPO_OWNER", "") or DEFAULT_REPO_OWNER
 SLACK_REPO_NAME = os.environ.get("SLACK_REPO_NAME", "") or DEFAULT_REPO_NAME
 
@@ -182,7 +550,7 @@ def get_repo_config_from_team_mapping(
     team_identifier: str, project_name: str = ""
 ) -> dict[str, str]:
     """Look up repository configuration from LINEAR_TEAM_TO_REPO mapping."""
-    fallback = {"owner": DEFAULT_REPO_OWNER, "name": DEFAULT_REPO_NAME}
+    fallback = {"owner": DEFAULT_REPO_OWNER, "name": DEFAULT_REPO_NAME} if DEFAULT_REPO_NAME else {}
 
     if not team_identifier or team_identifier not in LINEAR_TEAM_TO_REPO:
         return fallback
@@ -607,7 +975,13 @@ async def get_slack_repo_config(
             logger.exception("Failed to apply dashboard default_repo for Slack user")
 
     if not repo_config:
+        repo_config = await get_team_default_repo()
+
+    if not repo_config and default_owner and default_name:
         repo_config = {"owner": default_owner, "name": default_name}
+
+    if not repo_config:
+        raise HTTPException(400, "no default repository configured")
 
     return repo_config
 
@@ -777,6 +1151,7 @@ async def process_linear_issue(  # noqa: PLR0912, PLR0915
     )
     prompt = (
         f"Please work on the following issue:\n\n"
+        f"## Repository: {repo_config.get('owner')}/{repo_config.get('name')}\n\n"
         f"## Title: {title}\n\n"
         f"{triggered_by_line}"
         f"## Linear Ticket: {identifier} - Ticket ID: {issue_id}\n\n"
@@ -1096,10 +1471,14 @@ async def process_slack_mention(event_data: dict[str, Any], repo_config: dict[st
     langgraph_client = get_client(url=LANGGRAPH_URL)
     is_first_mention = not await _thread_exists(thread_id)
     await _upsert_slack_thread_repo_metadata(thread_id, repo_config, langgraph_client)
+    # Pass the login resolved above (from the stable Slack user id) so the thread is
+    # always tagged with github_login — the key the dashboard searches by. Without
+    # it, upsert re-resolves from the Slack profile email, which can miss.
     await upsert_agent_thread_owner_metadata(
         thread_id,
         source="slack",
         repo_config=repo_config,
+        github_login=mapped_login or "",
         user_email=user_email or "",
         title=clean_text if is_first_mention else "",
         source_context={"slack_thread": configurable["slack_thread"]},
@@ -1161,31 +1540,6 @@ async def process_slack_mention(event_data: dict[str, Any], repo_config: dict[st
                 run_id,
                 triggering_user_id=user_id,
             )
-
-
-async def process_slack_pr_review_request(
-    pr_ref: GitHubPrRef, channel_id: str, thread_ts: str
-) -> None:
-    await set_slack_assistant_status(channel_id, thread_ts)
-    result = await trigger_pr_review_from_ref(
-        pr_ref,
-        source="slack",
-        slack_channel_id=channel_id,
-        slack_thread_ts=thread_ts,
-    )
-    if result.get("success"):
-        thread_id = result.get("thread_id")
-        if isinstance(thread_id, str) and thread_id:
-            await post_slack_trace_reply(channel_id, thread_ts, thread_id)
-            await set_slack_assistant_status(channel_id, thread_ts)
-        return
-
-    await post_slack_thread_reply(
-        channel_id,
-        thread_ts,
-        f"Could not start review for <{pr_ref.url}|{pr_ref.owner}/{pr_ref.repo}#{pr_ref.number}>: "
-        f"{result.get('error', 'unknown error')}.",
-    )
 
 
 def verify_linear_signature(body: bytes, signature: str, secret: str) -> bool:
@@ -1323,6 +1677,12 @@ async def linear_webhook(  # noqa: PLR0911, PLR0912, PLR0915
                 "repo_config": repo_config,
             },
         )
+
+    if not repo_config:
+        repo_config = await get_team_default_repo()
+
+    if not repo_config:
+        return {"status": "ignored", "reason": "No default repository configured"}
 
     if not _is_repo_allowed(repo_config):
         logger.warning(
@@ -1467,6 +1827,86 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     return {"status": "accepted", "message": "Slack mention queued"}
 
 
+@app.post("/webhooks/slack/interactivity")
+async def slack_interactivity(
+    request: Request, background_tasks: BackgroundTasks
+) -> dict[str, str]:
+    """Handle Slack Block Kit interactions."""
+    body = await request.body()
+    signature = request.headers.get("X-Slack-Signature", "")
+    timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
+    if not verify_slack_signature(
+        body=body,
+        timestamp=timestamp,
+        signature=signature,
+        secret=SLACK_SIGNING_SECRET,
+    ):
+        logger.warning("Invalid Slack interactivity signature")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    form = parse_qs(body.decode("utf-8"))
+    payload_raw = (form.get("payload") or [""])[0]
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse Slack interactivity payload")
+        return {"status": "error", "message": "Invalid payload"}
+
+    action = _first_open_swe_option_action(payload.get("actions"))
+    if action is None:
+        return {"status": "ignored", "reason": "No Open SWE action"}
+
+    try:
+        action_value = json.loads(str(action.get("value") or "{}"))
+    except json.JSONDecodeError:
+        return {"status": "ignored", "reason": "Invalid action value"}
+    if action_value.get("type") != "open_swe_option":
+        return {"status": "ignored", "reason": "Unknown action type"}
+
+    response = str(action_value.get("response") or "").strip()
+    if not response:
+        return {"status": "ignored", "reason": "Empty response"}
+
+    channel = payload.get("channel") if isinstance(payload.get("channel"), dict) else {}
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+    container = payload.get("container") if isinstance(payload.get("container"), dict) else {}
+    user = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    channel_id = str(channel.get("id") or container.get("channel_id") or "")
+    event_ts = str(
+        action.get("action_ts") or message.get("ts") or container.get("message_ts") or ""
+    )
+    thread_ts = str(
+        message.get("thread_ts") or message.get("ts") or container.get("thread_ts") or event_ts
+    )
+    user_id = str(user.get("id") or "")
+    if not channel_id or not thread_ts or not event_ts or not user_id:
+        return {"status": "ignored", "reason": "Missing Slack action context"}
+
+    repo_config = await get_slack_repo_config(channel_id, thread_ts, slack_user_id=user_id)
+    background_tasks.add_task(
+        process_slack_mention,
+        {
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "event_ts": event_ts,
+            "user_id": user_id,
+            "text": response,
+            "bot_user_id": SLACK_BOT_USER_ID,
+        },
+        repo_config,
+    )
+    return {"status": "accepted", "message": "Slack option queued"}
+
+
+def _first_open_swe_option_action(actions: Any) -> dict[str, Any] | None:
+    if not isinstance(actions, list):
+        return None
+    for action in actions:
+        if isinstance(action, dict) and action.get("action_id") == "open_swe_option_select":
+            return action
+    return None
+
+
 @app.get("/webhooks/slack")
 async def slack_webhook_verify() -> dict[str, str]:
     """Verify endpoint for Slack webhook setup."""
@@ -1492,7 +1932,6 @@ _SUPPORTED_GH_EVENTS = frozenset(
 _SUPPORTED_GH_ISSUE_ACTIONS = frozenset(["edited", "opened", "reopened"])
 _SUPPORTED_GH_PULL_REQUEST_ACTIONS = frozenset(
     [
-        "review_requested",
         "opened",
         "ready_for_review",
         "converted_to_draft",
@@ -1540,17 +1979,27 @@ def build_github_issue_prompt(
     comments_text = _build_github_issue_comments_text(comments)
     sanitized_title = sanitize_github_comment_body(title)
     formatted_body = format_github_comment_body_for_prompt(issue_author or github_login, body)
+    owner = repo_config.get("owner", "")
+    name = repo_config.get("name", "")
     return (
         "Please work on the following GitHub issue:\n\n"
-        f"## Repository: {repo_config.get('owner')}/{repo_config.get('name')}\n\n"
+        f"## Repository: {owner}/{name}\n\n"
         f"{triggered_by_line}"
         f"## GitHub Issue: #{issue_number} - Issue ID: {issue_id}\n\n"
         f"## Title: {sanitized_title}\n\n"
         f"## Description:\n{formatted_body}\n"
         f"{comments_text}\n\n"
-        "Please analyze this issue and implement the necessary changes. "
-        "When you need to communicate on GitHub, use `GH_TOKEN=dummy gh issue comment` "
-        "with the issue number."
+        "Please analyze this issue and implement the necessary changes.\n\n"
+        "If code changes are needed:\n"
+        "1. Make the changes in the sandbox\n"
+        "2. Commit and push them, then open/update a draft PR with `GH_TOKEN=dummy gh` — this is REQUIRED, do NOT skip it\n"
+        f"3. Use `GH_TOKEN=dummy gh issue comment {issue_number} --repo {owner}/{name} --body '...'` "
+        "to post a summary on the GitHub issue — this is REQUIRED\n\n"
+        "If no code changes are needed:\n"
+        f"1. Use `GH_TOKEN=dummy gh issue comment {issue_number} --repo {owner}/{name} --body '...'` "
+        "to explain your answer on the GitHub issue — this is REQUIRED, never end silently\n\n"
+        "**You MUST always post a comment on the GitHub issue before finishing — "
+        "whether or not code changes were made.**"
     )
 
 
@@ -1617,12 +2066,6 @@ async def _trigger_or_queue_run(
     logger.info("LangGraph run created for thread %s from GitHub PR comment", thread_id)
 
 
-def _is_open_swe_reviewer_request(payload: dict[str, Any]) -> bool:
-    reviewer = payload.get("requested_reviewer") or {}
-    login = reviewer.get("login", "") if isinstance(reviewer, dict) else ""
-    return login.lower() == OPEN_SWE_BOT_NAME.lower()
-
-
 def build_github_pr_review_prompt(
     repo_config: dict[str, str],
     pr_number: int,
@@ -1668,6 +2111,46 @@ async def fetch_github_pr_metadata(pr_ref: GitHubPrRef, *, token: str) -> dict[s
     return data if isinstance(data, dict) else None
 
 
+def _repo_private_from_pr_metadata(pr_metadata: dict[str, Any]) -> bool | None:
+    repo = pr_metadata.get("base", {}).get("repo")
+    if isinstance(repo, dict) and isinstance(repo.get("private"), bool):
+        return repo["private"]
+    return None
+
+
+def _repo_id_from_pr_metadata(pr_metadata: dict[str, Any]) -> int | None:
+    repo = pr_metadata.get("base", {}).get("repo")
+    repo_id = repo.get("id") if isinstance(repo, dict) else None
+    return repo_id if isinstance(repo_id, int) else None
+
+
+def _repo_private_from_payload(payload: dict[str, Any]) -> bool | None:
+    repo = payload.get("repository")
+    private = repo.get("private") if isinstance(repo, dict) else None
+    return private if isinstance(private, bool) else None
+
+
+def _repo_id_from_payload(payload: dict[str, Any]) -> int | None:
+    repo = payload.get("repository")
+    repo_id = repo.get("id") if isinstance(repo, dict) else None
+    return repo_id if isinstance(repo_id, int) else None
+
+
+async def _reviewer_token_for_repo(
+    repo_config: dict[str, str],
+    *,
+    repo_private: bool | None,
+    repo_id: int | None = None,
+) -> tuple[str | None, str | None]:
+    if repo_private is False:
+        if repo_id is not None:
+            return await get_github_app_installation_token_with_expiry(repository_ids=[repo_id])
+        repo_name = repo_config.get("name")
+        if repo_name:
+            return await get_github_app_installation_token_with_expiry(repositories=[repo_name])
+    return await get_github_app_installation_token_with_expiry()
+
+
 async def trigger_pr_review_from_ref(
     pr_ref: GitHubPrRef,
     *,
@@ -1681,6 +2164,8 @@ async def trigger_pr_review_from_ref(
     if not await _is_repo_enabled_for_review(repo_config):
         return {"success": False, "error": "Repository not enabled for review"}
 
+    # Full token to read PR metadata (privacy/id aren't in the trigger ref);
+    # re-scoped below once we know whether the repo is public.
     app_token, app_token_expires_at = await get_github_app_installation_token_with_expiry()
     if not app_token:
         logger.warning("No GitHub App token available for PR reviewer request")
@@ -1689,6 +2174,17 @@ async def trigger_pr_review_from_ref(
     pr_metadata = await fetch_github_pr_metadata(pr_ref, token=app_token)
     if not pr_metadata:
         return {"success": False, "error": "Could not fetch pull request metadata"}
+
+    repo_private = _repo_private_from_pr_metadata(pr_metadata)
+    repo_id = _repo_id_from_pr_metadata(pr_metadata)
+    app_token, app_token_expires_at = await _reviewer_token_for_repo(
+        repo_config,
+        repo_private=repo_private,
+        repo_id=repo_id,
+    )
+    if not app_token:
+        logger.warning("No GitHub App token available for PR reviewer request")
+        return {"success": False, "error": "No GitHub App token available"}
 
     base_sha = pr_metadata.get("base", {}).get("sha", "")
     head = pr_metadata.get("head", {})
@@ -1706,12 +2202,6 @@ async def trigger_pr_review_from_ref(
     if not await _ensure_thread_exists_for_metadata(thread_id, langgraph_client):
         return {"success": False, "error": "Could not create reviewer thread"}
 
-    try:
-        await persist_encrypted_github_token(thread_id, app_token, expires_at=app_token_expires_at)
-    except Exception:
-        logger.warning("Could not persist bot token for reviewer thread %s", thread_id)
-        return {"success": False, "error": "Could not persist reviewer token"}
-
     pr_meta: ReviewerPRMeta = {
         "owner": pr_ref.owner,
         "name": pr_ref.repo,
@@ -1728,7 +2218,14 @@ async def trigger_pr_review_from_ref(
             "thread_ts": slack_thread_ts,
         }
     await set_reviewer_thread_metadata(
-        thread_id, pr=pr_meta, watch=True, slack_thread=slack_thread_meta
+        thread_id, pr=pr_meta, watch=True, slack_thread=slack_thread_meta, head_sha=head_sha
+    )
+    await post_review_started_comment(
+        thread_id=thread_id,
+        owner=pr_ref.owner,
+        repo=pr_ref.repo,
+        pr_number=pr_ref.number,
+        token=app_token,
     )
 
     prompt = build_github_pr_review_prompt(repo_config, pr_ref.number, pr_url, base_sha, head_sha)
@@ -1742,6 +2239,7 @@ async def trigger_pr_review_from_ref(
         base_sha=base_sha,
         head_sha=head_sha,
         branch_name=branch_name,
+        repo_private=repo_private,
         slack_channel_id=slack_channel_id,
         slack_thread_ts=slack_thread_ts,
     )
@@ -1781,6 +2279,7 @@ def _build_reviewer_configurable(
     base_sha: str,
     head_sha: str,
     branch_name: str,
+    repo_private: bool | None = None,
     re_review: bool = False,
     last_reviewed_sha: str = "",
     slack_channel_id: str = "",
@@ -1801,6 +2300,8 @@ def _build_reviewer_configurable(
     }
     if branch_name:
         configurable["branch_name"] = branch_name
+    if repo_private is not None:
+        configurable["repo_private"] = repo_private
     if last_reviewed_sha:
         configurable["last_reviewed_sha"] = last_reviewed_sha
     if slack_channel_id and slack_thread_ts:
@@ -1836,6 +2337,8 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         "owner": repo.get("owner", {}).get("login", ""),
         "name": repo.get("name", ""),
     }
+    repo_private = _repo_private_from_payload(payload)
+    repo_id = _repo_id_from_payload(payload)
     pr_number = pull_request.get("number")
     pr_url = pull_request.get("html_url", "") or pull_request.get("url", "")
     branch_name = pull_request.get("head", {}).get("ref", "")
@@ -1881,7 +2384,11 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
                     return
                 last_reviewed_sha = existing_last_reviewed_sha
 
-    app_token, app_token_expires_at = await get_github_app_installation_token_with_expiry()
+    app_token, app_token_expires_at = await _reviewer_token_for_repo(
+        repo_config,
+        repo_private=repo_private,
+        repo_id=repo_id,
+    )
     if not app_token:
         logger.warning("No GitHub App token available for reviewer dispatch")
         return
@@ -1890,13 +2397,7 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
     if not await _ensure_thread_exists_for_metadata(thread_id, langgraph_client):
         return
 
-    try:
-        await persist_encrypted_github_token(thread_id, app_token, expires_at=app_token_expires_at)
-    except Exception:
-        logger.warning("Could not persist bot token for reviewer thread %s", thread_id)
-        return
-
-    await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True)
+    await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True, head_sha=head_sha)
 
     is_re_review = bool(last_reviewed_sha)
     if is_re_review:
@@ -1917,6 +2418,7 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         base_sha=base_sha,
         head_sha=head_sha,
         branch_name=branch_name,
+        repo_private=repo_private,
         re_review=is_re_review,
         last_reviewed_sha=last_reviewed_sha,
     )
@@ -1939,11 +2441,6 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
     logger.info("Reviewer run created for thread %s (source=%s)", thread_id, source)
 
 
-async def process_github_pr_review_request(payload: dict[str, Any]) -> None:
-    """Trigger the reviewer agent when the Open SWE bot is requested on a PR."""
-    await _dispatch_first_review_from_pr_payload(payload, source="github")
-
-
 async def process_github_pr_ready(payload: dict[str, Any]) -> None:
     """Auto-review a PR that has just been opened or marked ready-for-review.
 
@@ -1961,79 +2458,10 @@ async def process_github_pr_ready(payload: dict[str, Any]) -> None:
                 author_login or "<unknown>",
             )
             return
-    # Use source="github" so the auth resolver finds the bot token persisted on
-    # the thread; "github_auto" would fall through to the email-based path,
-    # which has no user_email to route on for webhook-triggered runs.
+    # Use source="github" so the reviewer resolver can use the GitHub App token;
+    # "github_auto" would fall through to the email-based path, which has no
+    # user_email to route on for webhook-triggered runs.
     await _dispatch_first_review_from_pr_payload(payload, source="github")
-
-
-async def process_github_pr_review_command(
-    payload: dict[str, Any],
-    event_type: str,
-    pr_url_override: str | None,
-) -> None:
-    """Trigger the reviewer when a PR comment contains ``@open-swe review``.
-
-    ``pr_url_override`` is the optional URL token that followed ``review``. If
-    set, the review targets that PR; otherwise the comment's own PR is used.
-    """
-    repo = payload.get("repository", {})
-    repo_config = {
-        "owner": repo.get("owner", {}).get("login", ""),
-        "name": repo.get("name", ""),
-    }
-    pr_data = payload.get("pull_request") or payload.get("issue", {})
-    sender = payload.get("sender", {})
-    github_login = sender.get("login", "")
-    github_user_id = sender.get("id")
-
-    pr_ref: GitHubPrRef | None = None
-    if pr_url_override:
-        pr_ref = parse_github_pr_url(pr_url_override)
-        if pr_ref is None:
-            logger.info("Ignoring @open-swe review with unparseable URL %s", pr_url_override)
-            return
-    else:
-        pr_number = pr_data.get("number")
-        if not pr_number:
-            logger.warning("@open-swe review command missing pr_number, skipping")
-            return
-        pr_ref = GitHubPrRef(
-            owner=repo_config["owner"],
-            repo=repo_config["name"],
-            number=pr_number,
-            url=pr_data.get("html_url", "") or pr_data.get("url", ""),
-        )
-
-    comment = payload.get("comment") or payload.get("review", {})
-    comment_id = comment.get("id")
-    node_id = comment.get("node_id") if event_type == "pull_request_review" else None
-    if comment_id:
-        app_token = await get_github_app_installation_token()
-        if app_token:
-            await react_to_github_comment(
-                repo_config,
-                comment_id,
-                event_type=event_type,
-                token=app_token,
-                pull_number=pr_data.get("number"),
-                node_id=node_id,
-            )
-
-    result = await trigger_pr_review_from_ref(
-        pr_ref,
-        source="github",
-        github_login=github_login,
-        github_user_id=github_user_id,
-    )
-    if not result.get("success"):
-        logger.warning(
-            "Failed to trigger reviewer from @open-swe review on %s/%s#%s: %s",
-            pr_ref.owner,
-            pr_ref.repo,
-            pr_ref.number,
-            result.get("error"),
-        )
 
 
 async def _fetch_open_pr_for_branch(
@@ -2204,6 +2632,8 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         "owner": repo.get("owner", {}).get("login", "") or repo.get("owner", {}).get("name", ""),
         "name": repo.get("name", ""),
     }
+    repo_private = _repo_private_from_payload(payload)
+    repo_id = _repo_id_from_payload(payload)
     if not repo_config["owner"] or not repo_config["name"]:
         logger.warning("Push to %s ignored: repository owner/name missing from payload", head_ref)
         return
@@ -2216,7 +2646,11 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         )
         return
 
-    app_token, app_token_expires_at = await get_github_app_installation_token_with_expiry()
+    app_token, app_token_expires_at = await _reviewer_token_for_repo(
+        repo_config,
+        repo_private=repo_private,
+        repo_id=repo_id,
+    )
     if not app_token:
         logger.warning("No GitHub App token for push re-review on %s", head_ref)
         return
@@ -2231,6 +2665,21 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         )
         return
 
+    # Push payloads normally carry repo privacy/id; fall back to PR metadata.
+    # If the repo turns out public, re-scope the token so reviewer.py doesn't
+    # proxy a full-installation token for a public PR.
+    if repo_private is None:
+        repo_private = _repo_private_from_pr_metadata(pr)
+        repo_id = repo_id or _repo_id_from_pr_metadata(pr)
+        if repo_private is False:
+            app_token, app_token_expires_at = await _reviewer_token_for_repo(
+                repo_config,
+                repo_private=repo_private,
+                repo_id=repo_id,
+            )
+            if not app_token:
+                logger.warning("No GitHub App token for push re-review on %s", head_ref)
+                return
     pr_number = pr.get("number")
     pr_url = pr.get("html_url") or pr.get("url") or ""
     base_sha = pr.get("base", {}).get("sha", "")
@@ -2291,11 +2740,6 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
     if not await _ensure_thread_exists_for_metadata(thread_id, langgraph_client):
         return
     try:
-        await persist_encrypted_github_token(thread_id, app_token, expires_at=app_token_expires_at)
-    except Exception:
-        logger.warning("Could not persist bot token for reviewer thread %s", thread_id)
-        return
-    try:
         threads = await fetch_pr_review_threads(
             owner=repo_config["owner"],
             repo=repo_config["name"],
@@ -2315,7 +2759,7 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         "head_ref": head_ref,
         "base_ref": base_ref,
     }
-    await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True)
+    await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True, head_sha=head_sha)
 
     re_review_prompt = (
         f"A new commit has been pushed to PR #{pr_number}. The new HEAD is "
@@ -2332,6 +2776,7 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         base_sha=base_sha,
         head_sha=head_sha,
         branch_name=head_ref,
+        repo_private=repo_private,
         re_review=True,
         last_reviewed_sha=last_reviewed_sha if isinstance(last_reviewed_sha, str) else "",
     )
@@ -2363,24 +2808,20 @@ async def _refresh_thread_github_token_after_401(thread_id: str, email: str) -> 
 
 
 async def _get_or_resolve_thread_github_token(thread_id: str, email: str) -> str | None:
-    """Resolve and persist a GitHub token for a thread when available.
+    """Resolve and cache a GitHub token for a thread when available.
 
-    Skips the cached ciphertext when its ``github_token_expires_at`` is past.
     In bot-token-only mode, returns a fresh GitHub App installation token
     instead of resolving per-user OAuth tokens.
     """
     if is_bot_token_only_mode():
         bot_token, expires_at = await get_github_app_installation_token_with_expiry()
         if bot_token:
-            try:
-                await persist_encrypted_github_token(thread_id, bot_token, expires_at=expires_at)
-            except Exception:
-                logger.warning("Could not persist bot token for thread %s", thread_id)
+            cache_github_token_for_thread(thread_id, bot_token, expires_at=expires_at)
             return bot_token
         logger.warning("Bot-token-only mode but GitHub App token unavailable")
         return None
 
-    github_token, _encrypted_token, _expires_at = await get_github_token_from_thread(thread_id)
+    github_token, _expires_at = await get_github_token_from_thread(thread_id)
     if github_token:
         return github_token
 
@@ -2389,12 +2830,10 @@ async def _get_or_resolve_thread_github_token(thread_id: str, email: str) -> str
     if not github_token:
         return None
 
-    try:
-        await persist_encrypted_github_token(
-            thread_id, github_token, expires_at=auth_result.get("expires_at")
-        )
-    except Exception:
-        logger.warning("Could not persist GitHub token for thread %s", thread_id)
+    expires_at = auth_result.get("expires_at")
+    cache_github_token_for_thread(
+        thread_id, github_token, expires_at=expires_at if isinstance(expires_at, str) else None
+    )
     return github_token
 
 
@@ -2453,20 +2892,9 @@ async def process_github_pr_comment(payload: dict[str, Any], event_type: str) ->
             else:
                 logger.warning("Failed to persist branch_name metadata for thread %s", thread_id)
 
-    comment = payload.get("comment") or payload.get("review", {})
-    is_review_request, _pr_url_override = parse_github_review_command(comment.get("body") or "")
     email = await email_for_login(github_login) or ""
     if email:
         github_token = await _get_or_resolve_thread_github_token(thread_id, email)
-    elif is_review_request:
-        github_token, expires_at = await get_github_app_installation_token_with_expiry()
-        if github_token:
-            try:
-                await persist_encrypted_github_token(thread_id, github_token, expires_at=expires_at)
-            except Exception:
-                logger.warning(
-                    "Could not persist bot token for PR review request thread %s", thread_id
-                )
     else:
         logger.warning("No email mapping for GitHub user '%s', skipping", github_login)
         return
@@ -2599,6 +3027,8 @@ async def process_github_review_finding_reply(payload: dict[str, Any]) -> None:
         "owner": repo.get("owner", {}).get("login", ""),
         "name": repo.get("name", ""),
     }
+    repo_private = _repo_private_from_payload(payload)
+    repo_id = _repo_id_from_payload(payload)
     pr_number = pull_request.get("number")
     if not isinstance(pr_number, int):
         return
@@ -2610,13 +3040,12 @@ async def process_github_review_finding_reply(payload: dict[str, Any]) -> None:
     if metadata is None or metadata.get("kind") != REVIEWER_THREAD_KIND:
         return
 
-    app_token, app_token_expires_at = await get_github_app_installation_token_with_expiry()
+    app_token, app_token_expires_at = await _reviewer_token_for_repo(
+        repo_config,
+        repo_private=repo_private,
+        repo_id=repo_id,
+    )
     if not app_token:
-        return
-    try:
-        await persist_encrypted_github_token(thread_id, app_token, expires_at=app_token_expires_at)
-    except Exception:
-        logger.warning("Could not persist bot token for reviewer thread %s", thread_id)
         return
 
     threads = await fetch_pr_review_threads(
@@ -2669,6 +3098,7 @@ async def process_github_review_finding_reply(payload: dict[str, Any]) -> None:
         base_sha=base_sha,
         head_sha=head_sha,
         branch_name=branch_name,
+        repo_private=repo_private,
         re_review=True,
     )
     configurable.update(
@@ -2916,24 +3346,11 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
             logger.info("Accepted GitHub PR %s webhook, scheduling auto-review task", action)
             background_tasks.add_task(process_github_pr_ready, payload)
             return {"status": "accepted", "message": f"Processing PR {action} for auto-review"}
-        if not _is_open_swe_reviewer_request(payload):
-            logger.info("Ignoring PR review request for a different reviewer")
-            return {"status": "ignored", "reason": "Review request is not for open-swe bot"}
-        if not await _is_repo_enabled_for_review(webhook_repo_config):
-            logger.warning(
-                "Rejecting GitHub reviewer webhook: repo '%s/%s' not enabled for review",
-                webhook_repo_config.get("owner"),
-                webhook_repo_config.get("name"),
-            )
-            return {"status": "ignored", "reason": "Repository not enabled for review"}
-
-        gate_rejection = await _enforce_public_repo_org_gate(payload, "pull_request")
-        if gate_rejection is not None:
-            return gate_rejection
-
-        logger.info("Accepted GitHub PR review request webhook, scheduling reviewer task")
-        background_tasks.add_task(process_github_pr_review_request, payload)
-        return {"status": "accepted", "message": "Processing GitHub PR review request"}
+        logger.info("Ignoring unsupported GitHub pull_request action: %s", action)
+        return {
+            "status": "ignored",
+            "reason": f"Unsupported GitHub pull_request action: {action}",
+        }
 
     if event_type == "push":
         if not await _is_repo_enabled_for_review(webhook_repo_config):
@@ -2943,7 +3360,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
         return {"status": "accepted", "message": "Processing GitHub push for reviewer watch"}
 
     if not _is_repo_allowed(webhook_repo_config):
-        logger.warning(
+        logger.debug(
             "Rejecting GitHub webhook: repo '%s/%s' not in allowlist",
             webhook_repo_config.get("owner"),
             webhook_repo_config.get("name"),

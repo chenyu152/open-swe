@@ -8,9 +8,7 @@ from agent.utils.slack import (
     TRACE_REPLY_TIPS,
     convert_mentions_to_slack_format,
     format_slack_messages_for_prompt,
-    looks_like_slack_pr_review_command,
     parse_github_pr_url,
-    parse_slack_review_command,
     post_slack_trace_reply,
     replace_bot_mention_with_username,
     select_slack_context_messages,
@@ -155,52 +153,6 @@ def test_parse_github_pr_url_slack_formatted_link() -> None:
     assert pr_ref.number == 1244
 
 
-def test_parse_slack_review_command_requires_exact_review_command() -> None:
-    pr_ref = parse_slack_review_command("review https://github.com/langchain-ai/open-swe/pull/1244")
-
-    assert pr_ref is not None
-    assert pr_ref.owner == "langchain-ai"
-    assert pr_ref.repo == "open-swe"
-    assert pr_ref.number == 1244
-    assert (
-        parse_slack_review_command(
-            "please review https://github.com/langchain-ai/open-swe/pull/1244"
-        )
-        is None
-    )
-    assert (
-        parse_slack_review_command("review https://github.com/langchain-ai/open-swe/issues/1244")
-        is None
-    )
-
-
-def test_parse_slack_review_command_supports_slack_link() -> None:
-    pr_ref = parse_slack_review_command(
-        "review <https://github.com/langchain-ai/open-swe/pull/1244|PR>"
-    )
-
-    assert pr_ref is not None
-    assert pr_ref.url == "https://github.com/langchain-ai/open-swe/pull/1244"
-
-
-def test_parse_slack_review_command_supports_slack_wrapped_raw_link() -> None:
-    pr_ref = parse_slack_review_command(
-        "review <https://github.com/langchain-ai/open-swe/pull/1244>"
-    )
-
-    assert pr_ref is not None
-    assert pr_ref.url == "https://github.com/langchain-ai/open-swe/pull/1244"
-
-
-def test_looks_like_slack_pr_review_command_validates_github_host() -> None:
-    assert looks_like_slack_pr_review_command(
-        "review https://github.com/langchain-ai/open-swe/issues/1244"
-    )
-    assert not looks_like_slack_pr_review_command(
-        "review https://example.com/redirect?next=https://github.com/langchain-ai/open-swe/pull/1244"
-    )
-
-
 def test_format_slack_messages_for_prompt_uses_name_and_id() -> None:
     formatted = format_slack_messages_for_prompt(
         [{"ts": "1.0", "text": "hello", "user": "U123"}],
@@ -221,7 +173,7 @@ def test_format_slack_messages_for_prompt_replaces_bot_id_mention_in_text() -> N
     assert formatted == "@alice(U123): @open-swe status update?"
 
 
-def test_post_slack_trace_reply_emits_tip_only_when_no_trace_url(
+def test_post_slack_trace_reply_includes_web_link_without_trace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     posted: list[dict] = []
@@ -237,6 +189,7 @@ def test_post_slack_trace_reply_emits_tip_only_when_no_trace_url(
         posted.append({"text": text, "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
         return "1.1", None
 
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://app.example.com/")
     monkeypatch.setattr(
         slack_utils, "post_slack_thread_reply_with_ts", fake_post_slack_thread_reply_with_ts
     )
@@ -246,8 +199,10 @@ def test_post_slack_trace_reply_emits_tip_only_when_no_trace_url(
 
     assert len(posted) == 1
     text = posted[0]["text"]
-    assert text.startswith("_Tip: ") and text.endswith("_")
-    assert any(tip in text for tip in TRACE_REPLY_TIPS)
+    head, _, tip_line = text.partition("\n")
+    assert head == "<https://app.example.com/agents/thread-id|Open in Web>"
+    assert tip_line.startswith("_Tip: ") and tip_line.endswith("_")
+    assert any(tip in tip_line for tip in TRACE_REPLY_TIPS)
     assert posted[0]["unfurl_links"] is False
     assert posted[0]["unfurl_media"] is False
 
@@ -268,6 +223,7 @@ def test_post_slack_trace_reply_includes_trace_link_and_tip(
         posted.append({"text": text, "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
         return "1.1", None
 
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://app.example.com")
     monkeypatch.setattr(
         slack_utils, "post_slack_thread_reply_with_ts", fake_post_slack_thread_reply_with_ts
     )
@@ -278,9 +234,47 @@ def test_post_slack_trace_reply_includes_trace_link_and_tip(
     assert len(posted) == 1
     text = posted[0]["text"]
     head, _, tip_line = text.partition("\n")
-    assert head == "<https://smith/x|View trace>"
+    assert (
+        head
+        == "<https://smith/x|View trace> • <https://app.example.com/agents/thread-id|Open in Web>"
+    )
     assert tip_line.startswith("_Tip: ") and tip_line.endswith("_")
     assert any(tip in tip_line for tip in TRACE_REPLY_TIPS)
+    assert posted[0]["unfurl_links"] is False
+    assert posted[0]["unfurl_media"] is False
+
+
+def test_post_slack_trace_reply_can_skip_web_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[dict] = []
+
+    async def fake_post_slack_thread_reply_with_ts(
+        channel_id: str,
+        thread_ts: str,
+        text: str,
+        *,
+        unfurl_links: bool = True,
+        unfurl_media: bool = True,
+    ) -> tuple[str | None, str | None]:
+        posted.append({"text": text, "unfurl_links": unfurl_links, "unfurl_media": unfurl_media})
+        return "1.1", None
+
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "https://app.example.com")
+    monkeypatch.setattr(
+        slack_utils, "post_slack_thread_reply_with_ts", fake_post_slack_thread_reply_with_ts
+    )
+    monkeypatch.setattr(slack_utils, "get_langsmith_trace_url", lambda thread_id: "https://smith/x")
+
+    asyncio.run(
+        post_slack_trace_reply("C123", "1.0", "reviewer-thread-id", include_dashboard_link=False)
+    )
+
+    assert len(posted) == 1
+    head, _, tip_line = posted[0]["text"].partition("\n")
+    assert head == "<https://smith/x|View trace>"
+    assert "Open in Web" not in posted[0]["text"]
+    assert tip_line.startswith("_Tip: ") and tip_line.endswith("_")
     assert posted[0]["unfurl_links"] is False
     assert posted[0]["unfurl_media"] is False
 
@@ -399,6 +393,24 @@ def test_get_slack_repo_config_applies_profile_default_repo(
     repo = asyncio.run(webapp.get_slack_repo_config("C123", "1.234", slack_user_id="U123"))
 
     assert repo == {"owner": "profile-owner", "name": "profile-repo"}
+
+
+def test_get_slack_repo_config_applies_team_default_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threads_client = _FakeThreadsClient(thread={"metadata": {}})
+
+    async def fake_get_team_default_repo() -> dict[str, str] | None:
+        return {"owner": "team-owner", "name": "team-repo"}
+
+    monkeypatch.setattr(webapp, "get_client", lambda url: _FakeClient(threads_client))
+    monkeypatch.setattr(webapp, "get_team_default_repo", fake_get_team_default_repo)
+    monkeypatch.setattr(webapp, "SLACK_REPO_NAME", "")
+    monkeypatch.setattr(webapp, "DEFAULT_REPO_NAME", "")
+
+    repo = asyncio.run(webapp.get_slack_repo_config("C123", "1.234"))
+
+    assert repo == {"owner": "team-owner", "name": "team-repo"}
 
 
 def _setup_slack_mention_fakes(
@@ -869,8 +881,14 @@ def test_process_slack_mention_mapped_user_with_token_runs_as_user(
     async def fake_login_for_slack_id(slack_user_id):
         return "mason-gh" if slack_user_id == "U123" else None
 
+    owner_meta: dict[str, object] = {}
+
+    async def fake_upsert_owner(thread_id: str, **kwargs: object) -> None:
+        owner_meta.update(kwargs)
+
     monkeypatch.setattr(webapp, "_thread_exists", fake_thread_exists)
     monkeypatch.setattr(webapp, "login_for_slack_id", fake_login_for_slack_id)
+    monkeypatch.setattr(webapp, "upsert_agent_thread_owner_metadata", fake_upsert_owner)
 
     asyncio.run(
         webapp.process_slack_mention(
@@ -889,6 +907,10 @@ def test_process_slack_mention_mapped_user_with_token_runs_as_user(
     run_create = captured["run_create"]
     configurable = run_create["kwargs"]["config"]["configurable"]
     assert configurable["github_login"] == "mason-gh"
+    # The thread is tagged with the login resolved from the Slack user id, so it
+    # surfaces in the web Agents UI even when the Slack profile email does not
+    # resolve to a mapping (login_for_email returns None in this harness).
+    assert owner_meta["github_login"] == "mason-gh"
     assert "use_installation_token_fallback" not in configurable
     assert "prompt" not in captured
 

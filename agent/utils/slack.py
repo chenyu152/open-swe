@@ -17,16 +17,13 @@ from urllib.parse import urlparse
 import httpx
 from langgraph_sdk.client import LangGraphClient
 
+from agent.utils.dashboard_links import dashboard_thread_url
 from agent.utils.langsmith import get_langsmith_trace_url
 
 logger = logging.getLogger(__name__)
 
 SLACK_API_BASE_URL = "https://slack.com/api"
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
-GITHUB_PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/[^\s<>|]+/[^\s<>|]+/pull/\d+")
-URL_RE = re.compile(r"https?://[^\s<>|]+")
-
-
 DEFAULT_ASSISTANT_STATUS = "is thinking…"
 
 # Curated rotating loading strings shown by Slack while the indicator is active.
@@ -174,36 +171,6 @@ def parse_github_pr_url(url: str) -> GitHubPrRef | None:
     )
 
 
-def parse_slack_review_command(text: str) -> GitHubPrRef | None:
-    stripped = text.strip()
-    command_match = re.fullmatch(r"(?is)review\s+(.+)", stripped)
-    if not command_match:
-        return None
-
-    rest = command_match.group(1).strip()
-    url_match = GITHUB_PR_URL_RE.search(rest)
-    if not url_match:
-        return None
-
-    trailing_text = rest[url_match.end() :].strip()
-    if trailing_text and trailing_text != ">" and not trailing_text.startswith("|"):
-        return None
-
-    return parse_github_pr_url(url_match.group(0))
-
-
-def looks_like_slack_pr_review_command(text: str) -> bool:
-    stripped = text.strip()
-    if not re.match(r"(?is)^review\b", stripped):
-        return False
-    for match in URL_RE.finditer(stripped):
-        parsed = urlparse(match.group(0).strip("<>"))
-        host = (parsed.hostname or "").lower()
-        if parsed.scheme in {"http", "https"} and host in {"github.com", "www.github.com"}:
-            return True
-    return False
-
-
 def select_slack_context_messages(
     messages: list[dict[str, Any]],
     current_message_ts: str,
@@ -330,6 +297,7 @@ async def post_slack_thread_reply_with_ts(
     *,
     unfurl_links: bool = True,
     unfurl_media: bool = True,
+    blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[str | None, str | None]:
     """Post a reply in a Slack thread and return its Slack timestamp and error."""
     if not SLACK_BOT_TOKEN:
@@ -342,6 +310,8 @@ async def post_slack_thread_reply_with_ts(
         "unfurl_links": unfurl_links,
         "unfurl_media": unfurl_media,
     }
+    if blocks:
+        payload["blocks"] = blocks
 
     async with httpx.AsyncClient() as http_client:
         try:
@@ -715,20 +685,28 @@ TRACE_REPLY_TIPS: tuple[str, ...] = (
 )
 
 
-def _format_trace_reply(trace_url: str | None) -> str:
+def _format_trace_reply(trace_url: str | None, dashboard_url: str | None) -> str:
     """Format the initial trace reply with a randomly selected tip."""
     tip = random.choice(TRACE_REPLY_TIPS)
-    head = f"<{trace_url}|View trace>\n" if trace_url else ""
+    links = []
+    if trace_url:
+        links.append(f"<{trace_url}|View trace>")
+    if dashboard_url:
+        links.append(f"<{dashboard_url}|Open in Web>")
+    head = f"{' • '.join(links)}\n" if links else ""
     return f"{head}_Tip: {tip}_"
 
 
-async def post_slack_trace_reply(channel_id: str, thread_ts: str, thread_id: str) -> str | None:
+async def post_slack_trace_reply(
+    channel_id: str, thread_ts: str, thread_id: str, *, include_dashboard_link: bool = True
+) -> str | None:
     """Post a trace URL reply in a Slack thread and return its Slack timestamp."""
     trace_url = get_langsmith_trace_url(thread_id)
+    dashboard_url = dashboard_thread_url(thread_id) if include_dashboard_link else None
     message_ts, _ = await post_slack_thread_reply_with_ts(
         channel_id,
         thread_ts,
-        _format_trace_reply(trace_url),
+        _format_trace_reply(trace_url, dashboard_url),
         unfurl_links=False,
         unfurl_media=False,
     )

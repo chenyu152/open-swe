@@ -27,7 +27,7 @@ def _load_default_prompt() -> str:
     try:
         path = Path(DEFAULT_PROMPT_PATH)
         if path.is_file():
-            content = path.read_text().strip()
+            content = path.read_text(encoding="utf-8").strip()
             if content:
                 # Escape curly braces so .format() doesn't choke on them
                 escaped = content.replace("{", "{{").replace("}", "}}")
@@ -372,7 +372,7 @@ This run was triggered by **{display_name}**. You author the work **as them** â€
 - **Commits**: append this trailer (verbatim, on its own line, separated from the message body by a blank line) to every commit message you author. Add it to both the first commit and any follow-up commits in this run:
 
   ```
-  Co-authored-by: open-swe[bot] <open-swe@users.noreply.github.com>
+  {bot_coauthor_trailer}
   ```
 
 - **PR body**: append this line to the bottom of the PR description (separated from the body by a blank line) when you open or update the draft PR. Do not duplicate it if it is already present. If the PR body already contains a legacy footer like `_Opened collaboratively by {display_name} and open-swe._`, replace that legacy footer with this line instead of appending a second footer:
@@ -390,6 +390,7 @@ def _render_collaboration_section(identity: CollaboratorIdentity | None) -> str:
     return COLLABORATION_TEMPLATE.format(
         display_name=identity.display_name,
         pr_attribution_footer=PR_ATTRIBUTION_FOOTER,
+        bot_coauthor_trailer=f"Co-authored-by: {OPEN_SWE_BOT_NAME} <{OPEN_SWE_BOT_EMAIL}>",
     )
 
 
@@ -428,8 +429,15 @@ def construct_system_prompt(
     linear_issue_number: str = "",
     triggering_user_identity: CollaboratorIdentity | None = None,
     create_prs: bool = False,
+    default_repo: dict[str, str] | None = None,
 ) -> str:
     default_prompt_section = _load_default_prompt()
+    if default_repo and default_repo.get("owner") and default_repo.get("name"):
+        repo_line = (
+            "When a repository is not explicitly mentioned, use "
+            f"`{default_repo['owner']}/{default_repo['name']}`."
+        )
+        default_prompt_section += f"\n\n{repo_line}"
     # Shell-escape: display names/emails are user-controlled (e.g. O'Connor) and
     # are embedded in a `git config` command the agent copies verbatim.
     if triggering_user_identity is not None:

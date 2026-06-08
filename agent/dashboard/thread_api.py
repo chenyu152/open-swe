@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -11,16 +13,16 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
+from langchain_core.messages.content import create_image_block
 from langgraph_sdk.errors import InternalServerError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from ..utils.auth import persist_encrypted_github_token
 from ..utils.thread_ops import is_thread_active, langgraph_client, queue_message_for_thread
-from .agent_overrides import get_profile_default_repo
+from .agent_overrides import normalize_profile_overrides
 from .message_adapter import state_messages_to_ui
-from .options import SUPPORTED_MODEL_IDS, model_supports_effort
-from .profiles import OAUTH_TOKENS_NAMESPACE, get_profile, get_valid_access_token
-from .profiles import _get_value as get_oauth_record
+from .options import SUPPORTED_MODEL_IDS, model_supports_effort, model_supports_images
+from .profiles import get_profile, get_valid_access_token
+from .team_settings import get_team_default_model
 from .user_mappings import email_for_login
 
 logger = logging.getLogger(__name__)
@@ -28,8 +30,11 @@ logger = logging.getLogger(__name__)
 _ASSISTANT_ID = "agent"
 _DASHBOARD_SOURCE = "dashboard"
 _DASHBOARD_STREAM_MODES: tuple[str, ...] = ("values", "updates", "messages-tuple")
+_SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_MAX_DASHBOARD_IMAGES = 5
+_MAX_DASHBOARD_IMAGE_BYTES = 10 * 1024 * 1024
 # Sources whose threads should surface in the Agents UI (besides "dashboard").
-_SURFACED_SOURCES: tuple[str, ...] = ("dashboard", "github", "slack", "linear")
+_SURFACED_SOURCES: tuple[str, ...] = ("dashboard", "github", "slack", "linear", "schedule")
 
 
 def _agent_version_metadata() -> dict[str, str]:
@@ -48,15 +53,27 @@ async def _resolve_run_email(login: str, profile: dict[str, Any]) -> str | None:
     return mapped or profile.get("email")
 
 
+class DashboardImageBody(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: str | None = None
+    base64: str = Field(min_length=1)
+    mime_type: str = Field(alias="mimeType", min_length=1)
+    file_name: str | None = Field(default=None, alias="fileName")
+
+
 class ThreadCreateBody(BaseModel):
-    prompt: str = Field(min_length=1, max_length=20_000)
+    prompt: str = Field(default="", max_length=20_000)
+    images: list[DashboardImageBody] = Field(default_factory=list)
     repo: str | None = None
+    repo_explicitly_none: bool = False
     model_id: str | None = None
     effort: str | None = None
 
 
 class ThreadMessageBody(BaseModel):
-    content: str = Field(min_length=1, max_length=20_000)
+    content: str = Field(default="", max_length=20_000)
+    images: list[DashboardImageBody] = Field(default_factory=list)
     model_id: str | None = None
     effort: str | None = None
 
@@ -69,6 +86,21 @@ def _normalize_model_choice(
     if not isinstance(effort, str) or not model_supports_effort(model_id, effort):
         return None, None
     return model_id, effort
+
+
+async def _resolve_agent_model_choice(
+    profile: dict[str, Any],
+    model_id: str | None,
+    effort: str | None,
+) -> tuple[str, str]:
+    resolved_model, resolved_effort = await get_team_default_model("agent")
+    profile_model, profile_effort = normalize_profile_overrides(profile)
+    if profile_model and profile_effort:
+        resolved_model, resolved_effort = profile_model, profile_effort
+    chosen_model, chosen_effort = _normalize_model_choice(model_id, effort)
+    if chosen_model and chosen_effort:
+        resolved_model, resolved_effort = chosen_model, chosen_effort
+    return resolved_model, resolved_effort
 
 
 def _now_ms() -> int:
@@ -87,17 +119,53 @@ def _parse_repo(full_name: str | None) -> dict[str, str] | None:
     return {"owner": owner, "name": name}
 
 
-async def _persist_dashboard_github_token(thread_id: str, login: str) -> None:
+def _decode_dashboard_image(image: DashboardImageBody) -> bytes:
+    if image.mime_type not in _SUPPORTED_IMAGE_MIME_TYPES:
+        raise HTTPException(422, f"unsupported image type: {image.mime_type}")
+    try:
+        data = base64.b64decode(image.base64, validate=True)
+    except binascii.Error as exc:
+        raise HTTPException(422, "invalid image data") from exc
+    if len(data) > _MAX_DASHBOARD_IMAGE_BYTES:
+        raise HTTPException(422, "image exceeds 10MB limit")
+    return data
+
+
+def _image_blocks(
+    images: list[DashboardImageBody], *, model_id: str | None
+) -> list[dict[str, Any]]:
+    if len(images) > _MAX_DASHBOARD_IMAGES:
+        raise HTTPException(422, f"at most {_MAX_DASHBOARD_IMAGES} images are supported")
+    if images and (not model_id or not model_supports_images(model_id)):
+        model_label = model_id or "the current model"
+        raise HTTPException(422, f"model {model_label} does not support image input")
+    return [
+        create_image_block(
+            base64=base64.b64encode(_decode_dashboard_image(image)).decode("ascii"),
+            mime_type=image.mime_type,
+        )
+        for image in images
+    ]
+
+
+def _user_message_content(
+    prompt: str, images: list[DashboardImageBody], *, model_id: str | None = None
+) -> str | list[dict[str, Any]]:
+    text = prompt.strip()
+    if not text and not images:
+        raise HTTPException(422, "prompt or image required")
+    if not images:
+        return text
+    return [
+        *_image_blocks(images, model_id=model_id),
+        *([{"type": "text", "text": text}] if text else []),
+    ]
+
+
+async def _ensure_dashboard_github_token(login: str) -> None:
     token = await get_valid_access_token(login)
     if not token:
         raise HTTPException(401, "github token unavailable, re-login required")
-    record = await get_oauth_record(OAUTH_TOKENS_NAMESPACE, login)
-    expires_at = record.get("token_expires_at") if isinstance(record, dict) else None
-    await persist_encrypted_github_token(
-        thread_id,
-        token,
-        expires_at=expires_at if isinstance(expires_at, str) else None,
-    )
 
 
 def _thread_owner_login(metadata: dict[str, Any]) -> str | None:
@@ -113,6 +181,14 @@ def _thread_owner_email(metadata: dict[str, Any]) -> str | None:
 def _thread_source(metadata: dict[str, Any]) -> str:
     source = metadata.get("source")
     return source if isinstance(source, str) and source else _DASHBOARD_SOURCE
+
+
+def _metadata_model_id(metadata: dict[str, Any]) -> str | None:
+    for key in ("resolved_model", "model"):
+        model = metadata.get(key)
+        if isinstance(model, str) and model in SUPPORTED_MODEL_IDS:
+            return model
+    return None
 
 
 def _user_owns_thread(metadata: dict[str, Any], login: str, email: str | None) -> bool:
@@ -147,7 +223,9 @@ def _metadata_repo(metadata: dict[str, Any]) -> tuple[str, str, str]:
 def _run_status_to_agent_status(thread_status: str | None, run_status: str | None) -> str:
     if thread_status == "busy" or run_status in {"pending", "running"}:
         return "running"
-    if run_status in {"error", "failed", "timeout", "interrupted"}:
+    if run_status in {"interrupted", "cancelled"}:
+        return "interrupted"
+    if run_status in {"error", "failed", "timeout"}:
         return "error"
     if run_status == "success":
         return "finished"
@@ -179,8 +257,8 @@ def _thread_summary(
     summary: dict[str, Any] = {
         "id": thread.get("thread_id") or thread.get("id"),
         "title": title,
-        "repo": name or "unknown",
-        "repoFullName": full_name or "unknown/unknown",
+        "repo": name,
+        "repoFullName": full_name,
         "branch": metadata.get("branch_name") or metadata.get("base_branch") or "main",
         "model": model,
         "effort": effort,
@@ -215,11 +293,11 @@ async def _latest_run_status(thread_id: str) -> str | None:
 
 
 async def list_dashboard_threads(
-    login: str, *, email: str | None = None, limit: int = 50
+    login: str, *, email: str | None = None, limit: int = 50, include_all: bool = False
 ) -> list[dict[str, Any]]:
     client = langgraph_client()
-    searches: list[dict[str, Any]] = [{"github_login": login}]
-    if email and email.strip():
+    searches: list[dict[str, Any]] = [{}] if include_all else [{"github_login": login}]
+    if not include_all and email and email.strip():
         searches.append({"triggering_user_email": email.strip().lower()})
 
     seen: dict[str, dict[str, Any]] = {}
@@ -234,7 +312,7 @@ async def list_dashboard_threads(
             if not isinstance(thread, dict):
                 continue
             meta = thread.get("metadata") if isinstance(thread.get("metadata"), dict) else {}
-            if not _user_owns_thread(meta, login, email):
+            if not include_all and not _user_owns_thread(meta, login, email):
                 continue
             thread_id = thread.get("thread_id") or thread.get("id")
             if isinstance(thread_id, str) and thread_id not in seen:
@@ -256,7 +334,6 @@ async def get_dashboard_thread(
         raise HTTPException(404, "thread not found") from exc
 
     metadata = thread.get("metadata") if isinstance(thread.get("metadata"), dict) else {}
-    _assert_thread_owner(metadata, login, email)
 
     messages: list[dict[str, Any]] = []
     try:
@@ -279,18 +356,9 @@ async def get_dashboard_thread(
     return _thread_summary(thread, messages=messages)
 
 
-async def _resolve_repo_config(login: str, repo: str | None) -> dict[str, str]:
-    parsed = _parse_repo(repo)
-    if parsed:
-        return parsed
-    profile_repo = await get_profile_default_repo(login)
-    if profile_repo:
-        return profile_repo
-    profile = await get_profile(login)
-    parsed = _parse_repo(profile.get("default_repo") if isinstance(profile, dict) else None)
-    if parsed:
-        return parsed
-    raise HTTPException(400, "no default repository configured — set one in Cloud Agents settings")
+def _resolve_repo_config(repo: str | None) -> dict[str, str]:
+    """Resolve the run's repo from the request, or ``{}`` when none is given."""
+    return _parse_repo(repo) or {}
 
 
 async def _start_agent_run(
@@ -298,42 +366,56 @@ async def _start_agent_run(
     *,
     login: str,
     repo_config: dict[str, str],
+    repo_explicitly_none: bool = False,
     prompt: str,
+    images: list[DashboardImageBody] | None = None,
     title: str | None = None,
     model_id: str | None = None,
     effort: str | None = None,
 ) -> dict[str, Any]:
     profile = await get_profile(login) or {}
     now_ms = _now_ms()
+    prompt = prompt.strip()
+    resolved_model, resolved_effort = await _resolve_agent_model_choice(profile, model_id, effort)
+    content = _user_message_content(prompt, images or [], model_id=resolved_model)
     chosen_model, chosen_effort = _normalize_model_choice(model_id, effort)
     metadata_model = chosen_model or profile.get("default_model") or "Default"
     metadata_effort = chosen_effort or profile.get("reasoning_effort")
-    metadata = {
+    has_repo = bool(repo_config.get("owner") and repo_config.get("name"))
+    metadata: dict[str, Any] = {
         "source": _DASHBOARD_SOURCE,
         "github_login": login,
         "title": title or prompt[:80] or "New agent",
-        "repo_owner": repo_config["owner"],
-        "repo_name": repo_config["name"],
         "base_branch": profile.get("base_branch") or "main",
         "branch_prefix": profile.get("branch_prefix"),
         "model": metadata_model,
         "effort": metadata_effort,
+        "resolved_model": resolved_model,
+        "resolved_effort": resolved_effort,
         "created_at_ms": now_ms,
         "updated_at_ms": now_ms,
     }
+    if has_repo:
+        metadata["repo_owner"] = repo_config["owner"]
+        metadata["repo_name"] = repo_config["name"]
+    elif repo_explicitly_none:
+        metadata["repo_explicitly_none"] = True
 
     client = langgraph_client()
     await client.threads.create(thread_id=thread_id, metadata=metadata, if_exists="do_nothing")
     await client.threads.update(thread_id=thread_id, metadata=metadata)
-    await _persist_dashboard_github_token(thread_id, login)
+    await _ensure_dashboard_github_token(login)
 
     configurable: dict[str, Any] = {
         "thread_id": thread_id,
         "source": _DASHBOARD_SOURCE,
         "github_login": login,
-        "repo": repo_config,
         "user_email": await _resolve_run_email(login, profile),
     }
+    if has_repo:
+        configurable["repo"] = repo_config
+    elif repo_explicitly_none:
+        configurable["repo_explicitly_none"] = True
     if chosen_model and chosen_effort:
         configurable["agent_model_id"] = chosen_model
         configurable["agent_effort"] = chosen_effort
@@ -341,7 +423,7 @@ async def _start_agent_run(
     run = await client.runs.create(
         thread_id,
         _ASSISTANT_ID,
-        input={"messages": [{"role": "user", "content": prompt}]},
+        input={"messages": [{"role": "user", "content": content}]},
         config={"configurable": configurable, "metadata": _agent_version_metadata()},
         if_not_exists="create",
         stream_mode=list(_DASHBOARD_STREAM_MODES),
@@ -359,13 +441,15 @@ async def _start_agent_run(
 
 
 async def create_dashboard_thread(login: str, body: ThreadCreateBody) -> dict[str, Any]:
-    repo_config = await _resolve_repo_config(login, body.repo)
+    repo_config = _resolve_repo_config(body.repo)
     thread_id = str(uuid.uuid4())
     return await _start_agent_run(
         thread_id,
         login=login,
         repo_config=repo_config,
-        prompt=body.prompt.strip(),
+        repo_explicitly_none=body.repo_explicitly_none,
+        prompt=body.prompt,
+        images=body.images,
         model_id=body.model_id,
         effort=body.effort,
     )
@@ -383,20 +467,30 @@ async def send_dashboard_message(
     metadata = thread.get("metadata") if isinstance(thread.get("metadata"), dict) else {}
     _assert_thread_owner(metadata, login, email)
     owner, name, _ = _metadata_repo(metadata)
-    if not owner or not name:
-        raise HTTPException(400, "thread is missing repository metadata")
 
     prompt = body.content.strip()
     now_ms = _now_ms()
     chosen_model, chosen_effort = _normalize_model_choice(body.model_id, body.effort)
-    metadata_update: dict[str, Any] = {"updated_at_ms": now_ms}
+    metadata_update: dict[str, Any] = {"source": _DASHBOARD_SOURCE, "updated_at_ms": now_ms}
     if chosen_model and chosen_effort:
         metadata_update["model"] = chosen_model
         metadata_update["effort"] = chosen_effort
-    await client.threads.update(thread_id=thread_id, metadata=metadata_update)
 
     if await is_thread_active(thread_id):
-        queued = await queue_message_for_thread(thread_id, prompt)
+        active_model = _metadata_model_id(metadata) if body.images else None
+        content = _user_message_content(prompt, body.images, model_id=active_model)
+        await client.threads.update(thread_id=thread_id, metadata=metadata_update)
+        queue_payload: dict[str, Any] = {"text": prompt, "source": _DASHBOARD_SOURCE}
+        if isinstance(content, list):
+            queue_payload["images"] = [
+                block
+                for block in content
+                if isinstance(block, dict) and block.get("type") != "text"
+            ]
+        queued = await queue_message_for_thread(
+            thread_id,
+            queue_payload,
+        )
         if not queued:
             raise HTTPException(502, "failed to queue follow-up message")
         thread = await client.threads.get(thread_id)
@@ -404,27 +498,33 @@ async def send_dashboard_message(
             thread if isinstance(thread, dict) else {"thread_id": thread_id, "metadata": metadata}
         )
 
-    await _persist_dashboard_github_token(thread_id, login)
     profile = await get_profile(login) or {}
-    thread_source = _thread_source(metadata)
+    resolved_model, resolved_effort = await _resolve_agent_model_choice(
+        profile, body.model_id, body.effort
+    )
+    metadata_update["resolved_model"] = resolved_model
+    metadata_update["resolved_effort"] = resolved_effort
+    content = _user_message_content(prompt, body.images, model_id=resolved_model)
+    await client.threads.update(thread_id=thread_id, metadata=metadata_update)
+
+    await _ensure_dashboard_github_token(login)
     configurable: dict[str, Any] = {
         "thread_id": thread_id,
-        "source": thread_source,
+        "source": _DASHBOARD_SOURCE,
         "github_login": login,
-        "repo": {"owner": owner, "name": name},
         "user_email": await _resolve_run_email(login, profile),
     }
-    source_context = metadata.get("source_context")
-    if isinstance(source_context, dict):
-        for key, value in source_context.items():
-            configurable.setdefault(key, value)
+    if owner and name:
+        configurable["repo"] = {"owner": owner, "name": name}
+    elif metadata.get("repo_explicitly_none") is True:
+        configurable["repo_explicitly_none"] = True
     if chosen_model and chosen_effort:
         configurable["agent_model_id"] = chosen_model
         configurable["agent_effort"] = chosen_effort
     run = await client.runs.create(
         thread_id,
         _ASSISTANT_ID,
-        input={"messages": [{"role": "user", "content": prompt}]},
+        input={"messages": [{"role": "user", "content": content}]},
         config={"configurable": configurable, "metadata": _agent_version_metadata()},
         stream_mode=list(_DASHBOARD_STREAM_MODES),
         stream_resumable=True,
@@ -455,7 +555,7 @@ async def cancel_dashboard_thread(
     run_id = metadata.get("latest_run_id")
     if isinstance(run_id, str) and run_id:
         try:
-            await client.runs.cancel(thread_id, run_id, wait=False)
+            await client.runs.cancel(thread_id, run_id, wait=False, action="interrupt")
         except Exception:
             logger.debug("Could not cancel run %s for thread %s", run_id, thread_id, exc_info=True)
 
@@ -493,12 +593,9 @@ async def stream_dashboard_thread(
     thread_id: str, login: str, *, email: str | None = None, last_event_id: str | None = None
 ) -> AsyncIterator[str]:
     try:
-        thread = await langgraph_client().threads.get(thread_id)
+        await langgraph_client().threads.get(thread_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(404, "thread not found") from exc
-
-    metadata = thread.get("metadata") if isinstance(thread.get("metadata"), dict) else {}
-    _assert_thread_owner(metadata, login, email)
 
     stream = await langgraph_client().threads.join_stream(
         thread_id,

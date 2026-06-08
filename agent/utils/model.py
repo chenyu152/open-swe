@@ -14,6 +14,7 @@ OpenAIReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
 AnthropicThinkingType = Literal["adaptive"]
 AnthropicEffort = Literal["low", "medium", "high", "xhigh", "max"]
 GoogleThinkingLevel = Literal["minimal", "low", "medium", "high"]
+FireworksReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
 
 
 class OpenAIReasoning(TypedDict, total=False):
@@ -32,18 +33,58 @@ class ModelKwargs(TypedDict, total=False):
     thinking_level: GoogleThinkingLevel | None
     temperature: float | None
     max_retries: int | None
+    model_kwargs: dict[str, object] | None
 
 
 _ANTHROPIC_EFFORTS: set[AnthropicEffort] = {"low", "medium", "high", "xhigh", "max"}
 
 
 def make_model(model_id: str, **kwargs: Unpack[ModelKwargs]):
+    import os
+    from dotenv import load_dotenv
+
+    # Robustly find and load the .env file in project root
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    while cur_dir and not os.path.exists(os.path.join(cur_dir, ".env")):
+        parent = os.path.dirname(cur_dir)
+        if parent == cur_dir:
+            break
+        cur_dir = parent
+    env_path = os.path.join(cur_dir, ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path, override=True)
+    else:
+        load_dotenv(override=True)
+
+    # Dynamic mapping of DeepSeek credentials/endpoints
+    if os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.environ["DEEPSEEK_API_KEY"]
+    if os.environ.get("DEEPSEEK_BASE_URL") and not os.environ.get("OPENAI_API_BASE"):
+        os.environ["OPENAI_API_BASE"] = os.environ["DEEPSEEK_BASE_URL"]
+
+    # Rewrite model ID to DeepSeek model name if we are routing to DeepSeek
+    openai_base = os.environ.get("OPENAI_API_BASE", "")
+    is_deepseek = "deepseek" in openai_base.lower() or bool(os.environ.get("DEEPSEEK_MODEL"))
+    
+    if is_deepseek and model_id.startswith("openai:"):
+        custom_model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        model_id = f"openai:{custom_model}"
+
     model_kwargs: dict[str, object] = kwargs.copy()
     model_kwargs.setdefault("max_retries", DEFAULT_MAX_RETRIES)
 
+    # DeepSeek doesn't support o1-style reasoning effort, pop it to avoid TypeError in openai client
+    if is_deepseek:
+        model_kwargs.pop("reasoning", None)
+        model_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
     if model_id.startswith("openai:"):
-        model_kwargs["base_url"] = OPENAI_RESPONSES_WS_BASE_URL
-        model_kwargs["use_responses_api"] = True
+        # Only override with OpenAI responses websocket base if a custom base is not explicitly set
+        if not os.environ.get("OPENAI_API_BASE"):
+            model_kwargs["base_url"] = OPENAI_RESPONSES_WS_BASE_URL
+            model_kwargs["use_responses_api"] = True
+        else:
+            model_kwargs["use_responses_api"] = False
 
     return init_chat_model(model=model_id, **model_kwargs)
 
@@ -55,10 +96,14 @@ def fallback_model_id_for(primary_model_id: str) -> str | None:
     when the provider has no configured cross-provider fallback (e.g. Google,
     local, or self-hosted providers we don't want to silently route off-host).
     """
+    import os
+
     if primary_model_id.startswith("anthropic:"):
-        return "openai:gpt-5.5"
+        if os.environ.get("OPENAI_API_KEY") or os.environ.get("DEEPSEEK_API_KEY"):
+            return "openai:gpt-5.5"
     if primary_model_id.startswith("openai:"):
-        return "anthropic:claude-opus-4-5"
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "anthropic:claude-opus-4-5"
     return None
 
 
@@ -99,9 +144,32 @@ def anthropic_effort_for(profile_effort: str | None) -> AnthropicEffort | None:
     return None
 
 
+def fireworks_reasoning_effort_for(profile_effort: str | None) -> FireworksReasoningEffort | None:
+    """Map profile effort to a Fireworks ``reasoning_effort`` value.
+
+    Fireworks' OpenAI-compatible API accepts ``reasoning_effort`` on its reasoning
+    models. ``none`` disables reasoning; ``xhigh``/``max`` are only honored by models
+    that advertise them (e.g. DeepSeek V4 Pro). The per-model ``efforts`` lists in
+    ``dashboard/options.py`` gate which values can actually reach this function.
+    """
+    if profile_effort == "none":
+        return "none"
+    if profile_effort == "low":
+        return "low"
+    if profile_effort == "medium":
+        return "medium"
+    if profile_effort == "high":
+        return "high"
+    if profile_effort == "xhigh":
+        return "xhigh"
+    if profile_effort == "max":
+        return "max"
+    return None
+
+
 def google_thinking_level_for(profile_effort: str | None) -> GoogleThinkingLevel | None:
     """Map profile effort to Gemini 3+ ``thinking_level``."""
-    if profile_effort == "none":
+    if profile_effort in ("minimal", "none"):
         return "minimal"
     if profile_effort == "low":
         return "low"
@@ -138,4 +206,8 @@ def provider_model_kwargs(
         thinking_level = google_thinking_level_for(profile_effort)
         if thinking_level is not None:
             kwargs["thinking_level"] = thinking_level
+    elif model_id.startswith("fireworks:"):
+        effort = fireworks_reasoning_effort_for(profile_effort)
+        if effort is not None:
+            kwargs["model_kwargs"] = {"reasoning_effort": effort}
     return kwargs

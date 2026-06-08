@@ -3,12 +3,21 @@
   "python_version": "3.12",
   "graphs": {
     "agent": "agent.server:get_agent",
+    "multi_agent": "agent.multi_agent.graph:get_multi_agent_graph",
     "reviewer": "agent.reviewer:get_reviewer_agent",
-    "analyzer": "agent.analyzer:get_analyzer"
+    "analyzer": "agent.analyzer:get_analyzer",
+    "scheduler": "agent.scheduler:get_scheduler"
   },
   "dependencies": ["."],
   "http": {
     "app": "agent.webapp:app"
   },
-  "env": ".env" 
+  "checkpointer": {
+    "ttl": {
+      "strategy": "delete",
+      "sweep_interval_minutes": 60,
+      "default_ttl": 43200
+    }
+  },
+  "env": ".env"
 }
